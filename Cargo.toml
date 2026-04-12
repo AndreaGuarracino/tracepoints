@@ -12,3 +12,7 @@ keywords = ["bioinformatics", "alignment", "compression"]
 [dependencies]
 #lib_wfa2 = { path = "/home/guarracino/Dropbox/git/lib_wfa2"}
 lib_wfa2 = { git = "https://github.com/AndreaGuarracino/lib_wfa2", rev = "8859b6a214141968f37d9bcb22552408318adda0"}
+
+[dev-dependencies]
+# Used by es2bit_bench to measure gzip-compressed byte sizes.
+flate2 = "1"
