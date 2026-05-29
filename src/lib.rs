@@ -263,6 +263,199 @@ pub fn cigar_to_variable_tracepoints_raw(
     to_variable_format(cigar_to_tracepoints_raw(cigar, max_value, metric))
 }
 
+// -----------------------------------------------------------------------------
+// ES-2bit (edit-script) encoding
+// -----------------------------------------------------------------------------
+//
+// An alignment encoding that drops every '=' / 'M' run from the CIGAR and 
+// packs each remaining {I,X,D} op into 2 bits, stored MSB-first within each byte.
+//
+// Op code mapping (MSB-first):
+//     00  =>  X  (mismatch; advances both query and target)
+//     01  =>  I  (insertion into query; advances query only)
+//     10  =>  D  (deletion from query; advances target only)
+//     11  =>  unused
+//
+// Storage: ⌈2·e/8⌉ bytes plus an `edit_count`.
+//
+// Note: the decoder normalizes indels to greedy-canonical form (rightmost
+// position inside any homopolymer / tandem repeat). Sequence content and edit
+// count are preserved; exact indel positions may differ from the input CIGAR.
+
+/// Op codes in the ES-2bit encoding
+const ES2BIT_CODE_X: u8 = 0b00;
+const ES2BIT_CODE_I: u8 = 0b01;
+const ES2BIT_CODE_D: u8 = 0b10;
+
+/// Encode a CIGAR as ES-2bit.
+///
+/// Drops every `=` / `M` run and packs each remaining `I` / `X` / `D` op into
+/// 2 bits (MSB-first within each byte). Appends a `11` sentinel at the end.
+///
+/// Special ops: (H/N/P/S) are not handled by this encoding.
+pub fn cigar_to_edit_script(cigar: &str) -> Vec<u8> {
+    let ops = cigar_str_to_cigar_ops(cigar);
+    let mut edit_script: Vec<u8> = Vec::new();
+    // Bit position within the current byte; 0 means empty, 8 means full.
+    let mut bits_in_last: u8 = 0;
+
+    for (len, op) in ops {
+        let code: u8 = match op {
+            '=' | 'M' => continue,
+            'X' => ES2BIT_CODE_X,
+            'I' => ES2BIT_CODE_I,
+            'D' => ES2BIT_CODE_D,
+            other => panic!(
+                "cigar_to_edit_script: unsupported CIGAR op '{}' (len={})",
+                other, len
+            ),
+        };
+        for _ in 0..len {
+            if bits_in_last == 0 || bits_in_last == 8 {
+                edit_script.push(0u8);
+                bits_in_last = 0;
+            }
+            // MSB-first: shift code to the most significant free slot.
+            let shift = 6 - bits_in_last; // 6, 4, 2, 0
+            let last = edit_script.last_mut().expect("just pushed");
+            *last |= code << shift;
+            bits_in_last += 2;
+        }
+    }
+
+    // Append sentinel 11 in the next available slot.
+    if bits_in_last == 0 || bits_in_last == 8 {
+        edit_script.push(0u8);
+        bits_in_last = 0;
+    }
+    let shift = 6 - bits_in_last;
+    let last = edit_script.last_mut().expect("just pushed sentinel byte");
+    *last |= 0b11 << shift;
+
+    edit_script
+}
+
+/// Reconstruct a CIGAR string from an ES-2bit edit script.
+///
+/// Walks `a_seq` (query) and `b_seq` (target) greedily, extending matches
+/// while bases agree and consuming one 2-bit op from `edit_script` on every
+/// mismatch. Stops when it reads the `11` sentinel.
+///
+/// The returned CIGAR uses `=` / `X` / `I` / `D` operations only and is in
+/// greedy-canonical form, that is indel positions are right-shifted within
+/// any run of identical bases. This means exact indel placement may differ
+/// from the CIGAR that was originally encoded.
+pub fn edit_script_to_cigar(
+    edit_script: &[u8],
+    a_seq: &[u8],
+    b_seq: &[u8],
+) -> String {
+    let mut out_ops: Vec<(usize, char)> = Vec::new();
+    let mut a_pos: usize = 0; // position in a_seq (query)
+    let mut b_pos: usize = 0; // position in b_seq (target)
+    let mut ops_consumed: usize = 0;
+
+    // Helper to emit one '=' op covering the run of equal bases (if any).
+    let extend_matches = |a_pos: &mut usize,
+                          b_pos: &mut usize,
+                          out_ops: &mut Vec<(usize, char)>| {
+        let start_a = *a_pos;
+        while *a_pos < a_seq.len() && *b_pos < b_seq.len() && a_seq[*a_pos] == b_seq[*b_pos] {
+            *a_pos += 1;
+            *b_pos += 1;
+        }
+        let match_run_len = *a_pos - start_a;
+        if match_run_len > 0 {
+            out_ops.push((match_run_len, '='));
+        }
+    };
+
+    loop {
+        // Decode the next 2-bit op from `edit_script`.
+        let bit_index = 2 * ops_consumed;
+        let byte_index = bit_index / 8;
+        let shift = 6 - (bit_index % 8) as u8; // 6,4,2,0 (MSB-first)
+        assert!(
+            byte_index < edit_script.len(),
+            "edit_script_to_cigar: missing sentinel - edit_script ended at ops_consumed={}",
+            ops_consumed
+        );
+
+        let code = (edit_script[byte_index] >> shift) & 0b11;
+        if code == 0b11 {
+            // Manage any trailing matches, then stop.
+            extend_matches(&mut a_pos, &mut b_pos, &mut out_ops);
+            break;
+        }
+
+        extend_matches(&mut a_pos, &mut b_pos, &mut out_ops);
+
+        match code {
+            ES2BIT_CODE_X => {
+                assert!(
+                    a_pos < a_seq.len() && b_pos < b_seq.len(),
+                    "edit_script_to_cigar: X at end of sequences (a_pos={}, b_pos={}, a_len={}, b_len={})",
+                    a_pos,
+                    b_pos,
+                    a_seq.len(),
+                    b_seq.len()
+                );
+                assert!(
+                    a_seq[a_pos] != b_seq[b_pos],
+                    "edit_script_to_cigar: X at matching position (a_pos={}, b_pos={}, base={})",
+                    a_pos,
+                    b_pos,
+                    a_seq[a_pos] as char
+                );
+                out_ops.push((1, 'X'));
+                a_pos += 1;
+                b_pos += 1;
+            }
+            ES2BIT_CODE_I => {
+                assert!(
+                    a_pos < a_seq.len(),
+                    "edit_script_to_cigar: I past end of query (a_pos={}, a_len={})",
+                    a_pos,
+                    a_seq.len()
+                );
+                out_ops.push((1, 'I'));
+                a_pos += 1;
+            }
+            ES2BIT_CODE_D => {
+                assert!(
+                    b_pos < b_seq.len(),
+                    "edit_script_to_cigar: D past end of target (b_pos={}, b_len={})",
+                    b_pos,
+                    b_seq.len()
+                );
+                out_ops.push((1, 'D'));
+                b_pos += 1;
+            }
+            _ => unreachable!(),
+        }
+        ops_consumed += 1;
+    }
+
+    // Sanity check: we should have consumed both sequences exactly.
+    assert_eq!(
+        a_pos,
+        a_seq.len(),
+        "edit_script_to_cigar: query not fully consumed (a_pos={}, a_len={})",
+        a_pos,
+        a_seq.len()
+    );
+    assert_eq!(
+        b_pos,
+        b_seq.len(),
+        "edit_script_to_cigar: target not fully consumed (b_pos={}, b_len={})",
+        b_pos,
+        b_seq.len()
+    );
+
+    merge_cigar_ops(&mut out_ops);
+    cigar_ops_to_cigar_string(&out_ops)
+}
+
 /// Reconstruct CIGAR string from standard tracepoints
 pub fn tracepoints_to_cigar(
     tracepoints: &[(usize, usize)],
@@ -926,7 +1119,7 @@ fn merge_cigar_ops(ops: &mut Vec<(usize, char)>) {
 }
 
 /// Parse CIGAR string into (length, operation) pairs
-fn cigar_str_to_cigar_ops(cigar: &str) -> Vec<(usize, char)> {
+pub(crate) fn cigar_str_to_cigar_ops(cigar: &str) -> Vec<(usize, char)> {
     let mut ops = Vec::new();
     let mut num = String::new();
     for ch in cigar.chars() {
@@ -2545,5 +2738,224 @@ mod tests {
             total_b <= b_seq.len(),
             "Reconstructed CIGAR should not overconsume b_seq"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // ES-2bit edit-script tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_es2bit_encoding() {
+        // --- Byte layout and sentinel placement ---
+        //
+        // Case A: 4 ops (2D + 2I) fill a byte exactly; sentinel spills into a
+        // new byte.
+        //   CIGAR "10=2D5=2I3=", sequences:
+        //   10=  AAAAAAAAAA vs AAAAAAAAAA
+        //   2D             vs CC
+        //   5=   GGGGG     vs GGGGG
+        //   2I   TT        vs
+        //   3=   AAA       vs AAA
+        let a_seq = b"AAAAAAAAAAGGGGGTTAAA";
+        let b_seq = b"AAAAAAAAAACCGGGGGAAA";
+        let script = cigar_to_edit_script("10=2D5=2I3=");
+        // byte 0: D D I I → 10 10 01 01 = 0b10100101
+        // byte 1: sentinel 11 in MSB slot → 0b11000000
+        assert_eq!(script.len(), 2, "sentinel must spill into a second byte when first is full");
+        assert_eq!(script[0], 0b10_10_01_01, "MSB-first op order: D D I I");
+        assert_eq!(script[1], 0b11_00_00_00, "sentinel 11 in MSB slot of second byte");
+        assert_eq!(edit_script_to_cigar(&script, a_seq, b_seq), "10=2D5=2I3=");
+
+        // Case B: 1 op (D); sentinel fits in the same byte.
+        // byte 0: D(10) sentinel(11) → 0b10_11_00_00
+        let script = cigar_to_edit_script("1D3=");
+        assert_eq!(script.len(), 1, "sentinel must fit in same byte as single op");
+        assert_eq!(script[0], 0b10_11_00_00, "D op then sentinel 11 in same byte");
+
+        // --- Canonicalization: indels right-shift within identical-base runs ---
+        //
+        // q="AAT", t="AAAT": a valid CIGAR is "1D3=" (delete first target A),
+        // but the greedy decoder always produces "2=1D1=" (rightmost placement).
+        let decoded = edit_script_to_cigar(&script, b"AAT", b"AAAT");
+        assert_eq!(decoded, "2=1D1=", "decoder must right-shift deletion into homopolymer");
+    }
+
+    #[test]
+    fn test_es2bit_random_stress_with_wfa() {
+        // Generate pseudo-random sequence pairs with several (n, eps), align
+        // with WFA (exact + MemoryMode::High), round-trip through ES-2bit,
+        // and assert that the decoded CIGAR is valid (it may differ by indel 
+        // placement) and the cost is preserved.
+        //
+        // Uses a fixed-seed xorshift32 PRNG so the test is deterministic.
+        fn xorshift32(state: &mut u32) -> u32 {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *state = x;
+            x
+        }
+        fn rand_base(state: &mut u32) -> u8 {
+            const BASES: &[u8; 4] = b"ACGT";
+            BASES[(xorshift32(state) as usize) & 0b11]
+        }
+        fn rand_seq(state: &mut u32, n: usize) -> Vec<u8> {
+            (0..n).map(|_| rand_base(state)).collect()
+        }
+        // Introduce edits into `q` to produce `t` at roughly the requested
+        // error rate. Each position independently gets a mismatch,
+        // insertion (into the target), deletion (from the target), or no
+        // edit with probability (eps/3, eps/3, eps/3, 1-eps).
+        fn mutate(state: &mut u32, q: &[u8], eps: f64) -> Vec<u8> {
+            let scale = u32::MAX as f64;
+            let thr_sub = (eps / 3.0 * scale) as u32;
+            let thr_ins = (2.0 * eps / 3.0 * scale) as u32;
+            let thr_del = (eps * scale) as u32;
+            let mut t = Vec::with_capacity(q.len());
+            for &b in q {
+                let r = xorshift32(state);
+                if r < thr_sub {
+                    // Substitution: emit a different base.
+                    let mut nb = rand_base(state);
+                    while nb == b {
+                        nb = rand_base(state);
+                    }
+                    t.push(nb);
+                } else if r < thr_ins {
+                    // Insertion into target: emit an extra base plus the
+                    // original.
+                    t.push(rand_base(state));
+                    t.push(b);
+                } else if r < thr_del {
+                    // Deletion from target: emit nothing for this base.
+                } else {
+                    t.push(b);
+                }
+            }
+            t
+        }
+
+        // Given a CIGAR and the query/target, reconstruct the gapped
+        // alignment rows and verify sequence-level consistency.
+        fn verify_mapping(cigar: &str, a_seq: &[u8], b_seq: &[u8]) -> bool {
+            let ops = cigar_str_to_cigar_ops(cigar);
+            let mut i = 0usize;
+            let mut j = 0usize;
+            for (len, op) in ops {
+                match op {
+                    '=' => {
+                        for _ in 0..len {
+                            if i >= a_seq.len() || j >= b_seq.len() {
+                                return false;
+                            }
+                            if a_seq[i] != b_seq[j] {
+                                return false;
+                            }
+                            i += 1;
+                            j += 1;
+                        }
+                    }
+                    'X' => {
+                        for _ in 0..len {
+                            if i >= a_seq.len() || j >= b_seq.len() {
+                                return false;
+                            }
+                            if a_seq[i] == b_seq[j] {
+                                return false;
+                            }
+                            i += 1;
+                            j += 1;
+                        }
+                    }
+                    'I' => {
+                        if i + len > a_seq.len() {
+                            return false;
+                        }
+                        i += len;
+                    }
+                    'D' => {
+                        if j + len > b_seq.len() {
+                            return false;
+                        }
+                        j += len;
+                    }
+                    'M' => {
+                        // Match-or-mismatch: only check bounds.
+                        if i + len > a_seq.len() || j + len > b_seq.len() {
+                            return false;
+                        }
+                        i += len;
+                        j += len;
+                    }
+                    _ => return false,
+                }
+            }
+            i == a_seq.len() && j == b_seq.len()
+        }
+
+        // Count the edit cost of a CIGAR (non-match ops).
+        fn cigar_cost(cigar: &str) -> usize {
+            cigar_str_to_cigar_ops(cigar)
+                .into_iter()
+                .filter(|(_, op)| !matches!(*op, '=' | 'M'))
+                .map(|(len, _)| len)
+                .sum()
+        }
+
+        let distance = Distance::Edit;
+        let mut aligner = distance.create_aligner(None, None);
+        let buckets: &[(usize, f64)] =
+            &[(100, 0.01), (1_000, 0.05), (1_000, 0.20)];
+        let samples_per_bucket = 10usize;
+        let mut state: u32 = 0xC0FFEE_u32;
+
+        for &(n, eps) in buckets {
+            for sample in 0..samples_per_bucket {
+                let q = rand_seq(&mut state, n);
+                let t = mutate(&mut state, &q, eps);
+                if t.is_empty() {
+                    continue;
+                }
+                let cigar_ops = align_sequences_wfa(&q, &t, &aligner);
+                let cigar = cigar_ops_to_cigar_string(&cigar_ops);
+
+                assert!(
+                    verify_mapping(&cigar, &q, &t),
+                    "WFA CIGAR failed to map q/t (n={}, eps={}, sample={})",
+                    n,
+                    eps,
+                    sample
+                );
+
+                let script = cigar_to_edit_script(&cigar);
+                let decoded = edit_script_to_cigar(&script, &q, &t);
+
+                // Sequence mapping must round-trip exactly, even though
+                // the literal CIGAR may have shifted indels.
+                assert!(
+                    verify_mapping(&decoded, &q, &t),
+                    "round-tripped CIGAR failed to map q/t \
+                     (n={}, eps={}, sample={})\n  orig:    {}\n  decoded: {}",
+                    n,
+                    eps,
+                    sample,
+                    cigar,
+                    decoded
+                );
+                assert_eq!(
+                    cigar_cost(&decoded),
+                    cigar_cost(&cigar),
+                    "edit cost must be preserved through ES-2bit round-trip \
+                     (n={}, eps={}, sample={})",
+                    n,
+                    eps,
+                    sample
+                );
+            }
+        }
+        // Touch the aligner to keep it alive through the loop — silences
+        // an unused warning on older clippy settings.
+        let _ = &mut aligner;
     }
 }
