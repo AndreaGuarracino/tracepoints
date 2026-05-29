@@ -68,6 +68,8 @@ pub enum TracepointType {
     Variable,
     /// FastGA tracepoints with CIGAR processing state
     Fastga,
+    /// FastGA tracepoints without stored diffs (b_len only per interval)
+    FastgaNoDiff,
 }
 
 impl TracepointType {
@@ -78,6 +80,7 @@ impl TracepointType {
             Self::Mixed => 1,
             Self::Variable => 2,
             Self::Fastga => 3,
+            Self::FastgaNoDiff => 4,
         }
     }
 
@@ -88,6 +91,7 @@ impl TracepointType {
             1 => Ok(Self::Mixed),
             2 => Ok(Self::Variable),
             3 => Ok(Self::Fastga),
+            4 => Ok(Self::FastgaNoDiff),
             _ => Err(format!("Invalid tracepoint type byte: {}", byte)),
         }
     }
@@ -99,7 +103,8 @@ impl TracepointType {
             "mixed" => Ok(Self::Mixed),
             "variable" => Ok(Self::Variable),
             "fastga" => Ok(Self::Fastga),
-            _ => Err(format!("Invalid tracepoint type '{}'. Expected 'standard', 'mixed', 'variable', or 'fastga'", s)),
+            "fastga-no-diff" => Ok(Self::FastgaNoDiff),
+            _ => Err(format!("Invalid tracepoint type '{}'. Expected 'standard', 'mixed', 'variable', 'fastga', or 'fastga-no-diff'", s)),
         }
     }
 
@@ -110,6 +115,7 @@ impl TracepointType {
             Self::Mixed => "mixed",
             Self::Variable => "variable",
             Self::Fastga => "fastga",
+            Self::FastgaNoDiff => "fastga-no-diff",
         }
     }
 }
@@ -121,6 +127,7 @@ pub enum TracepointData {
     Mixed(Vec<MixedRepresentation>),
     Variable(Vec<(usize, Option<usize>)>),
     Fastga(Vec<(usize, usize)>),
+    FastgaNoDiff(Vec<usize>),
 }
 
 impl TracepointData {
@@ -130,6 +137,7 @@ impl TracepointData {
             Self::Mixed(_) => TracepointType::Mixed,
             Self::Variable(_) => TracepointType::Variable,
             Self::Fastga(_) => TracepointType::Fastga,
+            Self::FastgaNoDiff(_) => TracepointType::FastgaNoDiff,
         }
     }
 
@@ -139,6 +147,11 @@ impl TracepointData {
             Self::Standard(tps) | Self::Fastga(tps) => tps
                 .iter()
                 .map(|(a, b)| format!("{},{}", a, b))
+                .collect::<Vec<_>>()
+                .join(";"),
+            Self::FastgaNoDiff(tps) => tps
+                .iter()
+                .map(|b| b.to_string())
                 .collect::<Vec<_>>()
                 .join(";"),
             Self::Variable(tps) => tps
@@ -164,6 +177,7 @@ impl TracepointData {
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Standard(tps) | Self::Fastga(tps) => tps.is_empty(),
+            Self::FastgaNoDiff(tps) => tps.is_empty(),
             Self::Variable(tps) => tps.is_empty(),
             Self::Mixed(items) => items.is_empty(),
         }
@@ -1097,23 +1111,22 @@ pub fn cigar_to_tracepoints_fastga(
             state,
         );
 
-        // Store the segment with its coordinate bounds
-        // Use the actual start positions which account for any prefix skip (for complement alignments)
-        // If cigarPrefix consumed everything, FASTGA outputs "0,0" - we do the same
-        let tracepoints = if tracepoints.is_empty() && new_state.completed {
-            vec![(0, 0)]
-        } else {
-            tracepoints
-        };
-        results.push((
-            tracepoints,
-            (
-                new_state.actual_query_start,
-                new_state.query_pos,
-                new_state.actual_target_start,
-                new_state.target_pos,
-            ),
-        ));
+        let qs = new_state.actual_query_start;
+        let qe = new_state.query_pos;
+        let ts = new_state.actual_target_start;
+        let te = new_state.target_pos;
+
+        if new_state.completed {
+            // If cigarPrefix consumed everything, FASTGA outputs "0,0" - we do the same
+            let tracepoints = if tracepoints.is_empty() { vec![(0, 0)] } else { tracepoints };
+            results.push((tracepoints, (qs, qe, ts, te)));
+            break;
+        }
+
+        // Skip zero-span segments (e.g. overflow cut exactly at query_end)
+        if qs < qe {
+            results.push((tracepoints, (qs, qe, ts, te)));
+        }
 
         // After first segment, switch target_end to reversed space for complement
         if is_first_segment && complement {
@@ -1121,7 +1134,8 @@ pub fn cigar_to_tracepoints_fastga(
         }
         is_first_segment = false;
 
-        if new_state.completed {
+        // Nothing left to process
+        if qe >= query_end {
             break;
         }
 
@@ -1155,6 +1169,101 @@ pub fn cigar_to_tracepoints_fastga(
 
         state = Some(CigarProcessingState {
             cigar_pos: new_state.cigar_pos + 1, // Move to next operation
+            remaining_len: 0,
+            query_pos: current_query_start,
+            target_pos: current_target_start,
+            completed: false,
+            actual_query_start: current_query_start,
+            actual_target_start: current_target_start,
+        });
+    }
+
+    results
+}
+
+/// Like `cigar_to_tracepoints_fastga` but stores only b_len per tracepoint (no diff).
+pub fn cigar_to_tracepoints_fastga_no_diff(
+    cigar: &str,
+    trace_spacing: u32,
+    query_start: usize,
+    query_end: usize,
+    _query_len: usize,
+    target_start: usize,
+    target_end: usize,
+    target_len: usize,
+    complement: bool,
+) -> Vec<(Vec<usize>, (usize, usize, usize, usize))> {
+    let mut results = Vec::new();
+    let mut state = None;
+    let mut current_query_start = query_start;
+    let mut current_target_start = target_start;
+    let mut current_target_end = target_end;
+    let mut is_first_segment = true;
+
+    loop {
+        let (tracepoints, new_state) = cigar_to_tracepoints_fastga_no_diff_with_overflow(
+            cigar,
+            trace_spacing,
+            current_query_start,
+            query_end,
+            current_target_start,
+            current_target_end,
+            target_len,
+            complement,
+            state,
+        );
+
+        let qs = new_state.actual_query_start;
+        let qe = new_state.query_pos;
+        let ts = new_state.actual_target_start;
+        let te = new_state.target_pos;
+
+        if new_state.completed {
+            let tracepoints = if tracepoints.is_empty() { vec![0] } else { tracepoints };
+            results.push((tracepoints, (qs, qe, ts, te)));
+            break;
+        }
+
+        // Skip zero-span segments (e.g. overflow cut exactly at query_end)
+        if qs < qe {
+            results.push((tracepoints, (qs, qe, ts, te)));
+        }
+
+        if is_first_segment && complement {
+            current_target_end = target_len - target_start;
+        }
+        is_first_segment = false;
+
+        // Nothing left to process
+        if qe >= query_end {
+            break;
+        }
+
+        current_query_start = new_state.query_pos;
+        current_target_start = new_state.target_pos;
+
+        if new_state.remaining_len > 0 {
+            let cigar_to_parse = if complement {
+                reverse_cigar(cigar)
+            } else {
+                cigar.to_string()
+            };
+            let ops = cigar_str_to_cigar_ops(&cigar_to_parse);
+            if new_state.cigar_pos < ops.len() {
+                let (_, op) = ops[new_state.cigar_pos];
+                match op {
+                    'I' => current_query_start += new_state.remaining_len,
+                    'D' => current_target_start += new_state.remaining_len,
+                    _ => {
+                        current_query_start += new_state.remaining_len;
+                        current_target_start += new_state.remaining_len;
+                    }
+                }
+            }
+        }
+
+        state = Some(CigarProcessingState {
+            cigar_pos: new_state.cigar_pos + 1,
             remaining_len: 0,
             query_pos: current_query_start,
             target_pos: current_target_start,
@@ -1427,6 +1536,218 @@ fn cigar_to_tracepoints_fastga_with_overflow(
     )
 }
 
+/// Like `cigar_to_tracepoints_fastga_with_overflow` but omits the diff field.
+///
+/// Returns only b_len per tracepoint; a_len is always implicit as trace_spacing.
+fn cigar_to_tracepoints_fastga_no_diff_with_overflow(
+    cigar: &str,
+    trace_spacing: u32,
+    query_start: usize,
+    query_end: usize,
+    target_start: usize,
+    target_end: usize,
+    target_len: usize,
+    complement: bool,
+    state: Option<CigarProcessingState>,
+) -> (Vec<usize>, CigarProcessingState) {
+    let trace_spacing = trace_spacing as usize;
+
+    let is_first_call = state.is_none();
+    let (target_start, target_end, cigar) = if complement && is_first_call {
+        (
+            target_len - target_end,
+            target_len - target_start,
+            reverse_cigar(cigar),
+        )
+    } else if complement {
+        (target_start, target_end, reverse_cigar(cigar))
+    } else {
+        (target_start, target_end, cigar.to_string())
+    };
+
+    let ops = cigar_str_to_cigar_ops(&cigar);
+    let mut tracepoints: Vec<usize> = Vec::new();
+
+    let (mut op_index, mut remaining_op_len, mut a_pos, mut b_pos) = if let Some(s) = state {
+        (s.cigar_pos, s.remaining_len, s.query_pos, s.target_pos)
+    } else if is_first_call && target_start == 0 {
+        let result = skip_prefix_for_complement(&ops, query_start, target_start);
+        if result.0 >= ops.len() {
+            (0, 0, query_start, target_start)
+        } else {
+            result
+        }
+    } else {
+        (0, 0, query_start, target_start)
+    };
+
+    let actual_query_start = a_pos;
+    let actual_target_start = b_pos;
+
+    let mut last_b_pos = b_pos;
+    let mut next_trace = ((a_pos / trace_spacing) + 1) * trace_spacing;
+
+    while op_index < ops.len() {
+        let (op_len, op) = ops[op_index];
+        let mut len = if remaining_op_len > 0 {
+            remaining_op_len
+        } else {
+            op_len
+        };
+        remaining_op_len = 0;
+
+        if a_pos >= query_end || b_pos >= target_end {
+            return (
+                tracepoints,
+                CigarProcessingState {
+                    cigar_pos: op_index,
+                    remaining_len: len,
+                    query_pos: a_pos,
+                    target_pos: b_pos,
+                    completed: false,
+                    actual_query_start,
+                    actual_target_start,
+                },
+            );
+        }
+
+        let original_len = len;
+        if (op == '=' || op == 'M' || op == 'X' || op == 'I') && a_pos + len > query_end {
+            len = query_end - a_pos;
+        }
+        if (op == '=' || op == 'M' || op == 'X' || op == 'D') && b_pos + len > target_end {
+            len = target_end - b_pos;
+        }
+
+        let remaining_after_boundary = original_len - len;
+
+        while len > 0 {
+            let consume = match op {
+                '=' | 'M' => {
+                    if a_pos + len > next_trace {
+                        let inc = next_trace - a_pos;
+                        a_pos = next_trace;
+                        b_pos += inc;
+                        tracepoints.push(b_pos - last_b_pos);
+                        last_b_pos = b_pos;
+                        next_trace += trace_spacing;
+                        inc
+                    } else {
+                        a_pos += len;
+                        b_pos += len;
+                        len
+                    }
+                }
+                'X' => {
+                    if a_pos + len > next_trace {
+                        let inc = next_trace - a_pos;
+                        a_pos = next_trace;
+                        b_pos += inc;
+                        tracepoints.push(b_pos - last_b_pos);
+                        last_b_pos = b_pos;
+                        next_trace += trace_spacing;
+                        inc
+                    } else {
+                        a_pos += len;
+                        b_pos += len;
+                        len
+                    }
+                }
+                'I' => {
+                    if trace_spacing + len > 200 {
+                        if a_pos > next_trace - trace_spacing {
+                            tracepoints.push(b_pos - last_b_pos);
+                        }
+                        return (
+                            tracepoints,
+                            CigarProcessingState {
+                                cigar_pos: op_index,
+                                remaining_len: len,
+                                query_pos: a_pos,
+                                target_pos: b_pos,
+                                completed: false,
+                                actual_query_start,
+                                actual_target_start,
+                            },
+                        );
+                    }
+
+                    if a_pos + len > next_trace {
+                        let inc = next_trace - a_pos;
+                        a_pos = next_trace;
+                        tracepoints.push(b_pos - last_b_pos);
+                        last_b_pos = b_pos;
+                        next_trace += trace_spacing;
+                        inc
+                    } else {
+                        a_pos += len;
+                        len
+                    }
+                }
+                'D' => {
+                    if (b_pos - last_b_pos) + len + (next_trace - a_pos) > 200 {
+                        if a_pos > next_trace - trace_spacing {
+                            tracepoints.push(b_pos - last_b_pos);
+                        }
+                        return (
+                            tracepoints,
+                            CigarProcessingState {
+                                cigar_pos: op_index,
+                                remaining_len: len,
+                                query_pos: a_pos,
+                                target_pos: b_pos,
+                                completed: false,
+                                actual_query_start,
+                                actual_target_start,
+                            },
+                        );
+                    }
+
+                    b_pos += len;
+                    len
+                }
+                'H' | 'N' | 'S' | 'P' => len,
+                _ => panic!("Invalid CIGAR operation: {op}"),
+            };
+            len -= consume;
+        }
+
+        if remaining_after_boundary > 0 {
+            return (
+                tracepoints,
+                CigarProcessingState {
+                    cigar_pos: op_index,
+                    remaining_len: remaining_after_boundary,
+                    query_pos: a_pos,
+                    target_pos: b_pos,
+                    completed: false,
+                    actual_query_start,
+                    actual_target_start,
+                },
+            );
+        }
+
+        op_index += 1;
+    }
+
+    if a_pos > next_trace - trace_spacing {
+        tracepoints.push(b_pos - last_b_pos);
+    }
+
+    (
+        tracepoints,
+        CigarProcessingState {
+            cigar_pos: op_index,
+            remaining_len: 0,
+            query_pos: a_pos,
+            target_pos: b_pos,
+            completed: true,
+            actual_query_start,
+            actual_target_start,
+        },
+    )
+}
+
 /// Reconstruct CIGAR from FASTGA-style tracepoints
 ///
 /// Uses edit distance internally for alignment.
@@ -1538,6 +1859,112 @@ pub fn tracepoints_to_cigar_fastga_with_aligner(
     let cigar = cigar_ops_to_cigar_string(&cigar_ops);
 
     // Reverse CIGAR for complement alignments
+    if complement {
+        reverse_cigar(&cigar)
+    } else {
+        cigar
+    }
+}
+
+/// Reconstruct CIGAR from FASTGA no-diff tracepoints (b_len only per interval).
+///
+/// Uses edit distance internally for alignment.
+pub fn tracepoints_to_cigar_fastga_no_diff(
+    segments: &[usize],
+    trace_spacing: u32,
+    a_seq: &[u8],
+    b_seq: &[u8],
+    a_start: usize,
+    b_start: usize,
+    complement: bool,
+    heuristic: bool,
+) -> String {
+    let distance = Distance::Edit;
+    let mut aligner = distance.create_aligner(None, None);
+    tracepoints_to_cigar_fastga_no_diff_with_aligner(
+        segments,
+        trace_spacing,
+        a_seq,
+        b_seq,
+        a_start,
+        b_start,
+        complement,
+        &mut aligner,
+        heuristic,
+    )
+}
+
+/// Like `tracepoints_to_cigar_fastga_no_diff`, but allows callers to reuse an existing aligner.
+pub fn tracepoints_to_cigar_fastga_no_diff_with_aligner(
+    segments: &[usize],
+    trace_spacing: u32,
+    a_seq: &[u8],
+    b_seq: &[u8],
+    a_start: usize,
+    _b_start: usize,
+    complement: bool,
+    aligner: &mut AffineWavefronts,
+    heuristic: bool,
+) -> String {
+    let trace_spacing = trace_spacing as usize;
+
+    let mut cigar_ops = Vec::new();
+
+    let mut current_a = 0;
+    let mut current_b = 0;
+
+    let first_boundary = ((a_start / trace_spacing) + 1) * trace_spacing - a_start;
+
+    for (i, &b_len) in segments.iter().enumerate() {
+        let a_len = if i == 0 {
+            first_boundary.min(a_seq.len() - current_a)
+        } else {
+            trace_spacing.min(a_seq.len() - current_a)
+        };
+
+        let a_end = (current_a + a_len).min(a_seq.len());
+        let b_end = (current_b + b_len).min(b_seq.len());
+
+        if a_end == current_a && b_end > current_b {
+            cigar_ops.push((b_end - current_b, 'D'));
+            current_b = b_end;
+        } else if b_end == current_b && a_end > current_a {
+            cigar_ops.push((a_end - current_a, 'I'));
+            current_a = a_end;
+        } else if a_end > current_a && b_end > current_b {
+            let seg_a_len = a_end - current_a;
+            let seg_b_len = b_end - current_b;
+            if seg_a_len == seg_b_len {
+                // Lengths match: use |b_len - a_len| = 0, treat as potential perfect match
+                cigar_ops.push((seg_a_len, '='));
+            } else {
+                // Estimate diff from length difference for optional banding
+                let num_diff = (seg_b_len as isize - seg_a_len as isize).unsigned_abs() as usize;
+                if heuristic && num_diff > 0 {
+                    let strategy = compute_banded_static_strategy(
+                        seg_a_len,
+                        seg_b_len,
+                        ComplexityMetric::EditDistance,
+                        num_diff as u32,
+                        &aligner.get_distance(),
+                    );
+                    aligner.set_heuristic(Some(&strategy));
+                }
+                let seg_ops = align_sequences_wfa(
+                    &a_seq[current_a..a_end],
+                    &b_seq[current_b..b_end],
+                    aligner,
+                );
+                cigar_ops.extend(seg_ops);
+            }
+            current_a = a_end;
+            current_b = b_end;
+        }
+    }
+
+    merge_cigar_ops(&mut cigar_ops);
+    let cigar = cigar_ops_to_cigar_string(&cigar_ops);
+
     if complement {
         reverse_cigar(&cigar)
     } else {
