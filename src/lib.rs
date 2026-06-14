@@ -1434,6 +1434,12 @@ fn cigar_to_tracepoints_fastga_with_overflow(
 
         // Check boundaries before processing
         if a_pos >= query_end || b_pos >= target_end {
+            if a_pos > next_trace - trace_spacing {
+                tracepoints.push((
+                    (diff - last_diff).unsigned_abs() as usize,
+                    b_pos - last_b_pos,
+                ));
+            }
             return (
                 tracepoints,
                 CigarProcessingState {
@@ -1441,7 +1447,7 @@ fn cigar_to_tracepoints_fastga_with_overflow(
                     remaining_len: len,
                     query_pos: a_pos,
                     target_pos: b_pos,
-                    completed: false,
+                    completed: true,
                     actual_query_start,
                     actual_target_start,
                 },
@@ -1581,6 +1587,12 @@ fn cigar_to_tracepoints_fastga_with_overflow(
 
         // If we had to truncate due to boundary, return with remaining length
         if remaining_after_boundary > 0 {
+            if a_pos > next_trace - trace_spacing {
+                tracepoints.push((
+                    (diff - last_diff).unsigned_abs() as usize,
+                    b_pos - last_b_pos,
+                ));
+            }
             return (
                 tracepoints,
                 CigarProcessingState {
@@ -1588,7 +1600,7 @@ fn cigar_to_tracepoints_fastga_with_overflow(
                     remaining_len: remaining_after_boundary,
                     query_pos: a_pos,
                     target_pos: b_pos,
-                    completed: false,
+                    completed: true,
                     actual_query_start,
                     actual_target_start,
                 },
