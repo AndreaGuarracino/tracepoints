@@ -1508,8 +1508,10 @@ fn cigar_to_tracepoints_fastga_with_overflow(
                     }
                 }
                 'I' => {
-                    // Check for overflow - if insertion would cause trace point overflow
-                    if trace_spacing + len > 200 {
+                    // Split into a new record when the insertion is longer than the
+                    // trace spacing. The threshold is 2*trace_spacing (== 200 at the
+                    // FASTGA default spacing of 100, preserving FASTGA's uint8s).
+                    if trace_spacing + len > 2 * trace_spacing {
                         // Push final tracepoint if we've passed the last boundary (matching C behavior)
                         if a_pos > next_trace - trace_spacing {
                             tracepoints.push((
@@ -1551,8 +1553,10 @@ fn cigar_to_tracepoints_fastga_with_overflow(
                     }
                 }
                 'D' => {
-                    // Check for overflow - if deletion would cause trace point overflow
-                    if (b_pos - last_b_pos) + len + (next_trace - a_pos) > 200 {
+                    // Split into a new record when the deletion is longer than the
+                    // trace spacing. The threshold is 2*trace_spacing (== 200 at the
+                    // FASTGA default spacing of 100, preserving FASTGA's uint8s).
+                    if (b_pos - last_b_pos) + len + (next_trace - a_pos) > 2 * trace_spacing {
                         // Push final tracepoint if we've passed the last boundary (matching C behavior)
                         if a_pos > next_trace - trace_spacing {
                             tracepoints.push((
