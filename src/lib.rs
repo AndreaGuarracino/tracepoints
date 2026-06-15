@@ -1269,6 +1269,16 @@ pub fn cigar_to_tracepoints_fastga(
     target_len: usize,
     complement: bool,
 ) -> Vec<(Vec<(usize, usize)>, (usize, usize, usize, usize))> {
+    // Pure-match alignment (only '='/'M', no mismatch or gap) represented as a single (0,0) sentinel.
+    {
+        let ops = cigar_str_to_cigar_ops(cigar);
+        if !ops.is_empty() && ops.iter().all(|&(_, op)| op == '=' || op == 'M') {
+            return vec![(
+                vec![(0, 0)],
+                (query_start, query_end, target_start, target_end),
+            )];
+        }
+    }
     let mut results = Vec::new();
     let mut state = None;
     let mut current_query_start = query_start;
@@ -1681,6 +1691,11 @@ pub fn tracepoints_to_cigar_fastga_with_aligner(
     heuristic: bool,
 ) -> String {
     let trace_spacing = trace_spacing as usize;
+
+    // Pure-match sentinel, so no realignment needed.
+    if segments.len() == 1 && segments[0] == (0, 0) {
+        return format!("{}=", a_seq.len());
+    }
 
     let mut cigar_ops = Vec::new();
 
