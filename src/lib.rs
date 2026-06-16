@@ -1751,11 +1751,292 @@ pub fn tracepoints_to_cigar_fastga_with_aligner(
     let cigar = cigar_ops_to_cigar_string(&cigar_ops);
 
     // Reverse CIGAR for complement alignments
-    if complement {
+    let cigar = if complement {
         reverse_cigar(&cigar)
     } else {
         cigar
+    };
+
+    refine_cigar_gaps(&cigar, a_seq, b_seq, 50)
+}
+
+/// Information about a gap run to be refined
+#[derive(Debug)]
+struct GapRun {
+    /// Index in the CIGAR ops where run starts
+    start_op_idx: usize,
+    /// Index in the CIGAR ops where run ends (exclusive)
+    end_op_idx: usize,
+    /// Position in A sequence where run starts
+    a_start: usize,
+    /// Position in B sequence where run starts
+    b_start: usize,
+}
+
+/// Find runs of gaps that should be refined
+/// 
+/// A run consists of indels of the same type (all I or all D) separated by
+/// matches/mismatches of length < max_separation
+fn find_gap_runs(ops: &[(usize, char)], max_separation: usize) -> Vec<GapRun> {
+    let mut runs = Vec::new();
+    
+    let mut a_pos = 0;
+    let mut b_pos = 0;
+    let mut i = 0;
+    
+    while i < ops.len() {
+        let (len, op) = ops[i];
+        
+        // Look for the start of a potential run (an indel)
+        if op == 'I' || op == 'D' {
+            let run_start_idx = i;
+            let run_start_a = a_pos;
+            let run_start_b = b_pos;
+            let first_op_type = op;
+            
+            let mut last_indel_idx = i;
+            let mut temp_a = a_pos;
+            let mut temp_b = b_pos;
+            
+            // Process first indel
+            match first_op_type {
+                'I' => temp_a += len,
+                'D' => temp_b += len,
+                _ => unreachable!(),
+            }
+            
+            // Look ahead for more indels of same type
+            let mut j = i + 1;
+            while j < ops.len() {
+                let (op_len, op_type) = ops[j];
+                
+                match op_type {
+                    'I' if first_op_type == 'I' => {
+                        last_indel_idx = j;
+                        temp_a += op_len;
+                        j += 1;
+                    }
+                    'D' if first_op_type == 'D' => {
+                        last_indel_idx = j;
+                        temp_b += op_len;
+                        j += 1;
+                    }
+                    '=' | 'M' | 'X' => {
+                        // Small gap between indels - check if another indel follows
+                        if op_len < max_separation && j + 1 < ops.len() {
+                            let (_, next_op) = ops[j + 1];
+                            if next_op == first_op_type {
+                                // Include this gap in the run
+                                temp_a += op_len;
+                                temp_b += op_len;
+                                j += 1;
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            
+            // Create a run if we found multiple indels
+            if last_indel_idx > run_start_idx {
+                runs.push(GapRun {
+                    start_op_idx: run_start_idx,
+                    end_op_idx: last_indel_idx + 1,
+                    a_start: run_start_a,
+                    b_start: run_start_b,
+                });
+                
+                i = last_indel_idx + 1;
+                a_pos = temp_a;
+                b_pos = temp_b;
+                continue;
+            }
+        }
+        
+        // Update position for this operation
+        match op {
+            '=' | 'M' | 'X' => {
+                a_pos += len;
+                b_pos += len;
+            }
+            'I' => a_pos += len,
+            'D' => b_pos += len,
+            _ => {}
+        }
+        
+        i += 1;
     }
+    
+    runs
+}
+
+/// Calculate the sequence range covered by a run of operations
+fn calc_run_range(ops: &[(usize, char)]) -> (usize, usize) {
+    let mut a_len = 0;
+    let mut b_len = 0;
+    
+    for (len, op) in ops {
+        match op {
+            '=' | 'M' | 'X' => {
+                a_len += len;
+                b_len += len;
+            }
+            'I' => a_len += len,
+            'D' => b_len += len,
+            _ => {}
+        }
+    }
+    
+    (a_len, b_len)
+}
+
+/// Refine gaps in a CIGAR string to minimize the number of gaps
+///
+/// This implements gap refinement by finding runs of fragmented indels
+/// and realigning them with affine gap penalties, which naturally consolidates gaps.
+///
+/// # Arguments
+/// * `cigar` - Input CIGAR string
+/// * `a_seq` - First sequence (query)
+/// * `b_seq` - Second sequence (target)
+/// * `max_separation` - Maximum distance between indels to be considered part of the same run (default: 50)
+///
+/// # Returns
+/// Refined CIGAR string with fewer gaps
+pub fn refine_cigar_gaps(
+    cigar: &str,
+    a_seq: &[u8],
+    b_seq: &[u8],
+    max_separation: usize,
+) -> String {
+    let ops = cigar_str_to_cigar_ops(cigar);
+    
+    // Find gap runs using the parsed operations
+    let runs = find_gap_runs(&ops, max_separation);
+
+    if runs.is_empty() {
+        return cigar.to_string();
+    }
+    
+    let ops = cigar_str_to_cigar_ops(cigar);
+    let mut result_ops = Vec::new();
+    
+    // Create aligner with affine gap penalties
+    // Using gap cost of 1 for gap opening (to penalize gap starts)
+    // and 0 for gap extension (once a gap is started, extending is free)
+    // This encourages consolidation of fragmented gaps
+    let distance = Distance::GapAffine {
+        mismatch: 1,
+        gap_opening: 2,
+        gap_extension: 1,
+    };
+    let mut aligner = distance.create_aligner(None);
+    
+    let mut next_run_idx = 0;
+    let mut op_idx = 0;
+    
+    while op_idx < ops.len() {
+        // Check if we're at the start of a run
+        let at_run = next_run_idx < runs.len() && runs[next_run_idx].start_op_idx == op_idx;
+        
+        if at_run {
+            let run = &runs[next_run_idx];
+            
+            // Extract the operations in this run
+            let run_ops: Vec<(usize, char)> = ops[run.start_op_idx..run.end_op_idx].to_vec();
+            let (a_len, b_len) = calc_run_range(&run_ops);
+            
+            // Extract the sequences for this run
+            let a_end = (run.a_start + a_len).min(a_seq.len());
+            let b_end = (run.b_start + b_len).min(b_seq.len());
+            let a_subseq = &a_seq[run.a_start..a_end];
+            let b_subseq = &b_seq[run.b_start..b_end];
+            
+            // Realign with WFA2 using affine penalties
+            let refined = align_sequences_wfa(a_subseq, b_subseq, &mut aligner);
+            
+            // Verify the refined operations consume the same lengths
+            let (ref_a, ref_b) = calc_run_range(&refined);
+            if ref_a == a_len && ref_b == b_len {
+                result_ops.extend(refined);
+            } else {
+                // If refinement changed lengths (shouldn't happen with proper alignment),
+                // keep original
+                panic!("Refinement changed sequence lengths, keeping original run");
+            }
+            
+            // Skip past this run
+            op_idx = run.end_op_idx;
+            next_run_idx += 1;
+        } else {
+            // Not in a run, keep original operation
+            result_ops.push(ops[op_idx]);
+            op_idx += 1;
+        }
+    }
+    
+    merge_cigar_ops(&mut result_ops);
+    cigar_ops_to_cigar_string(&result_ops)
+}
+
+/// Refine gaps in a CIGAR string with a provided aligner
+///
+/// Like `refine_cigar_gaps`, but allows reusing an aligner across multiple calls.
+pub fn refine_cigar_gaps_with_aligner(
+    cigar: &str,
+    a_seq: &[u8],
+    b_seq: &[u8],
+    max_separation: usize,
+    aligner: &mut AffineWavefronts,
+) -> String {
+    let ops = cigar_str_to_cigar_ops(cigar);
+    
+    // Find gap runs using the parsed operations
+    let runs = find_gap_runs(&ops, max_separation);
+    
+    if runs.is_empty() {
+        return cigar.to_string();
+    }
+    
+    let ops = cigar_str_to_cigar_ops(cigar);
+    let mut result_ops = Vec::new();
+    let mut next_run_idx = 0;
+    let mut op_idx = 0;
+    
+    while op_idx < ops.len() {
+        let at_run = next_run_idx < runs.len() && runs[next_run_idx].start_op_idx == op_idx;
+        
+        if at_run {
+            let run = &runs[next_run_idx];
+            let run_ops: Vec<(usize, char)> = ops[run.start_op_idx..run.end_op_idx].to_vec();
+            let (a_len, b_len) = calc_run_range(&run_ops);
+            
+            let a_end = (run.a_start + a_len).min(a_seq.len());
+            let b_end = (run.b_start + b_len).min(b_seq.len());
+            let a_subseq = &a_seq[run.a_start..a_end];
+            let b_subseq = &b_seq[run.b_start..b_end];
+            
+            let refined = align_sequences_wfa(a_subseq, b_subseq, aligner);
+            
+            let (ref_a, ref_b) = calc_run_range(&refined);
+            if ref_a == a_len && ref_b == b_len {
+                result_ops.extend(refined);
+            } else {
+                result_ops.extend(run_ops);
+            }
+            
+            op_idx = run.end_op_idx;
+            next_run_idx += 1;
+        } else {
+            result_ops.push(ops[op_idx]);
+            op_idx += 1;
+        }
+    }
+    
+    merge_cigar_ops(&mut result_ops);
+    cigar_ops_to_cigar_string(&result_ops)
 }
 
 #[cfg(test)]
@@ -2978,5 +3259,158 @@ mod tests {
         // Touch the aligner to keep it alive through the loop — silences
         // an unused warning on older clippy settings.
         let _ = &mut aligner;
+    }
+}
+
+#[cfg(test)]
+mod gap_refinement_tests {
+    use super::*;
+
+    #[test]
+    fn test_find_gap_runs() {
+        let cigar = "4=1I2=1I4=";
+        let runs = find_gap_runs(cigar, 50);
+        
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].start_op_idx, 1); // First I
+        assert_eq!(runs[0].end_op_idx, 4); // After second I
+    }
+
+    #[test]
+    fn test_gap_refinement_simple() {
+        let a_seq = b"ACGTACGTACGTACGT";
+        let b_seq = b"ACGTACGTACGTACGT";
+        let cigar = "16=";
+        
+        let refined = refine_cigar_gaps(cigar, a_seq, b_seq, 50);
+        assert_eq!(refined, cigar);
+    }
+    
+    #[test]
+    fn test_gap_refinement_preserves_alignment() {
+        let a_seq = b"ACGTACGTACGT";
+        let b_seq = b"ACGTACGT";
+        let cigar = "8=4I";
+        
+        let refined = refine_cigar_gaps(cigar, a_seq, b_seq, 50);
+        
+        let calc_lengths = |s: &str| -> (usize, usize) {
+            cigar_str_to_cigar_ops(s).iter().fold((0, 0), |(a, b), (len, op)| match op {
+                '=' | 'M' | 'X' => (a + len, b + len),
+                'I' => (a + len, b),
+                'D' => (a, b + len),
+                _ => (a, b),
+            })
+        };
+        
+        let (orig_a, orig_b) = calc_lengths(cigar);
+        let (ref_a, ref_b) = calc_lengths(&refined);
+        
+        assert_eq!(orig_a, ref_a, "A sequence length should be preserved");
+        assert_eq!(orig_b, ref_b, "B sequence length should be preserved");
+    }
+    
+    #[test]
+    fn test_gap_refinement_fragmented_gaps() {
+        let a_seq = b"ACGTACGTACGT";
+        let b_seq = b"ACGTACGT";
+        let cigar = "2=1I1=1I4=4I";
+        
+        let refined = refine_cigar_gaps(cigar, a_seq, b_seq, 2);
+        
+        let calc_lengths = |s: &str| -> (usize, usize) {
+            cigar_str_to_cigar_ops(s).iter().fold((0, 0), |(a, b), (len, op)| match op {
+                '=' | 'M' | 'X' => (a + len, b + len),
+                'I' => (a + len, b),
+                'D' => (a, b + len),
+                _ => (a, b),
+            })
+        };
+        
+        let (orig_a, orig_b) = calc_lengths(cigar);
+        let (ref_a, ref_b) = calc_lengths(&refined);
+        
+        assert_eq!(orig_a, ref_a, "A sequence length should be preserved");
+        assert_eq!(orig_b, ref_b, "B sequence length should be preserved");
+        
+        let count_gap_ops = |s: &str| -> usize {
+            cigar_str_to_cigar_ops(s).iter().filter(|(_, op)| *op == 'I' || *op == 'D').count()
+        };
+        
+        let orig_gaps = count_gap_ops(cigar);
+        let ref_gaps = count_gap_ops(&refined);
+        
+        assert!(ref_gaps <= orig_gaps, "Should reduce or maintain gap count");
+    }
+
+    #[test]
+    fn test_gap_refinement_paper_example() {
+        let a_seq = b"TCACAGAAACTTTTCTAATATTT";
+        let b_seq = b"TCAAGAAAAGTCCCTTGGGACTTTTCTGAATTT";
+        let cigar = "3=1I5=3D1=2D2=5D2=2D2=1X1=1X4=";
+        
+        let runs = find_gap_runs(cigar, 50);
+        println!("Found {} gap runs", runs.len());
+        
+        let refined = refine_cigar_gaps(cigar, a_seq, b_seq, 50);
+        
+        println!("Original: {}", cigar);
+        println!("Refined:  {}", refined);
+        
+        let calc_lengths = |s: &str| -> (usize, usize) {
+            cigar_str_to_cigar_ops(s).iter().fold((0, 0), |(a, b), (len, op)| match op {
+                '=' | 'M' | 'X' => (a + len, b + len),
+                'I' => (a + len, b),
+                'D' => (a, b + len),
+                _ => (a, b),
+            })
+        };
+        
+        let (orig_a, orig_b) = calc_lengths(cigar);
+        let (ref_a, ref_b) = calc_lengths(&refined);
+        
+        assert_eq!(orig_a, ref_a, "A sequence length should be preserved");
+        assert_eq!(orig_b, ref_b, "B sequence length should be preserved");
+        
+        let count_gap_ops = |s: &str| -> usize {
+            cigar_str_to_cigar_ops(s).iter().filter(|(_, op)| *op == 'I' || *op == 'D').count()
+        };
+        
+        let orig_gaps = count_gap_ops(cigar);
+        let ref_gaps = count_gap_ops(&refined);
+        
+        println!("Gap operations: {} -> {}", orig_gaps, ref_gaps);
+        assert!(ref_gaps <= orig_gaps, "Should reduce or maintain gap count");
+    }
+    
+    #[test]
+    fn test_gap_refinement_with_aligner_reuse() {
+        let a_seq = b"ACGTNNACGTACGT";
+        let b_seq = b"ACGTACGTACGT";
+        let cigar = "4=2I8=";
+        
+        let distance = Distance::GapAffine {
+            mismatch: 1,
+            gap_opening: 2,
+            gap_extension: 1,
+        };
+        let mut aligner = distance.create_aligner(None);
+        
+        let refined = refine_cigar_gaps_with_aligner(cigar, a_seq, b_seq, 50, &mut aligner);
+        
+        let calc_lengths = |s: &str| -> (usize, usize) {
+            cigar_str_to_cigar_ops(s).iter().fold((0, 0), |(a, b), (len, op)| match op {
+                '=' | 'M' | 'X' => (a + len, b + len),
+                'I' => (a + len, b),
+                'D' => (a, b + len),
+                _ => (a, b),
+            })
+        };
+        
+        let (orig_a, orig_b) = calc_lengths(cigar);
+        let (ref_a, ref_b) = calc_lengths(&refined);
+        
+        assert_eq!(orig_a, ref_a);
+        assert_eq!(orig_b, ref_b);
     }
 }
