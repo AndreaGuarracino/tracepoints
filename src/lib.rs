@@ -366,7 +366,7 @@ pub fn edit_script_to_cigar(
         }
         let match_run_len = *a_pos - start_a;
         if match_run_len > 0 {
-            out_ops.push((match_run_len, '='));
+            push_op(out_ops, match_run_len, '=');
         }
     };
 
@@ -407,7 +407,7 @@ pub fn edit_script_to_cigar(
                     b_pos,
                     a_seq[a_pos] as char
                 );
-                out_ops.push((1, 'X'));
+                push_op(&mut out_ops, 1, 'X');
                 a_pos += 1;
                 b_pos += 1;
             }
@@ -418,7 +418,7 @@ pub fn edit_script_to_cigar(
                     a_pos,
                     a_seq.len()
                 );
-                out_ops.push((1, 'I'));
+                push_op(&mut out_ops, 1, 'I');
                 a_pos += 1;
             }
             ES2BIT_CODE_D => {
@@ -428,7 +428,7 @@ pub fn edit_script_to_cigar(
                     b_pos,
                     b_seq.len()
                 );
-                out_ops.push((1, 'D'));
+                push_op(&mut out_ops, 1, 'D');
                 b_pos += 1;
             }
             _ => unreachable!(),
@@ -452,7 +452,6 @@ pub fn edit_script_to_cigar(
         b_seq.len()
     );
 
-    merge_cigar_ops(&mut out_ops);
     cigar_ops_to_cigar_string(&out_ops)
 }
 
@@ -605,19 +604,6 @@ pub fn variable_tracepoints_to_cigar_with_aligner(
     )
 }
 
-/// Align two sequence segments using WFA algorithm
-pub fn align_sequences_wfa(
-    query: &[u8],
-    target: &[u8],
-    aligner: &AffineWavefronts,
-) -> Vec<(usize, char)> {
-    let status = aligner.align(target, query); // Target vs query to get I/D in CIGAR for query insertions/deletions
-
-    match status {
-        AlignmentStatus::Completed => cigar_u8_to_cigar_ops(aligner.cigar()),
-        s => panic!("Alignment failed with status: {s:?}"),
-    }
-}
 
 // Helper functions
 
@@ -938,11 +924,11 @@ fn reconstruct_cigar_from_segments(
     for &(a_len, b_len) in segments {
         if a_len > 0 && b_len == 0 {
             // Pure insertion
-            cigar_ops.push((a_len, 'I'));
+            push_op(&mut cigar_ops, a_len, 'I');
             current_a += a_len;
         } else if b_len > 0 && a_len == 0 {
             // Pure deletion
-            cigar_ops.push((b_len, 'D'));
+            push_op(&mut cigar_ops, b_len, 'D');
             current_b += b_len;
         } else {
             // Mixed segment - realign with WFA
@@ -953,17 +939,17 @@ fn reconstruct_cigar_from_segments(
                     compute_banded_static_strategy(a_len, b_len, metric, mv, &aligner.get_distance());
                 aligner.set_heuristic(Some(&strategy));
             }
-            let seg_ops = align_sequences_wfa(
+            align_sequences_wfa(
                 &a_seq[current_a..a_end],
                 &b_seq[current_b..b_end],
                 &*aligner,
+                &mut cigar_ops,
             );
-            cigar_ops.extend(seg_ops);
             current_a = a_end;
             current_b = b_end;
         }
     }
-    merge_cigar_ops(&mut cigar_ops);
+
     cigar_ops_to_cigar_string(&cigar_ops)
 }
 
@@ -984,13 +970,17 @@ fn reconstruct_cigar_from_mixed_segments(
 
     for item in mixed_tracepoints {
         match item {
-            MixedRepresentation::CigarOp(len, op) => cigar_ops.push((*len, *op)),
+            MixedRepresentation::CigarOp(len, op) => {
+                if *len > 0 {
+                    push_op(&mut cigar_ops, *len, *op);
+                }
+            }
             MixedRepresentation::Tracepoint(a_len, b_len) => {
                 if *a_len > 0 && *b_len == 0 {
-                    cigar_ops.push((*a_len, 'I'));
+                    push_op(&mut cigar_ops, *a_len, 'I');
                     current_a += *a_len;
                 } else if *b_len > 0 && *a_len == 0 {
-                    cigar_ops.push((*b_len, 'D'));
+                    push_op(&mut cigar_ops, *b_len, 'D');
                     current_b += *b_len;
                 } else {
                     let a_end = current_a + *a_len;
@@ -1005,19 +995,18 @@ fn reconstruct_cigar_from_mixed_segments(
                         );
                         aligner.set_heuristic(Some(&strategy));
                     }
-                    let seg_ops = align_sequences_wfa(
+                    align_sequences_wfa(
                         &a_seq[current_a..a_end],
                         &b_seq[current_b..b_end],
                         &*aligner,
+                        &mut cigar_ops,
                     );
-                    cigar_ops.extend(seg_ops);
                     current_a = a_end;
                     current_b = b_end;
                 }
             }
         }
     }
-    merge_cigar_ops(&mut cigar_ops);
     cigar_ops_to_cigar_string(&cigar_ops)
 }
 
@@ -1093,31 +1082,6 @@ fn reverse_cigar(cigar: &str) -> String {
         .collect()
 }
 
-/// Merge consecutive CIGAR operations of the same type in-place
-fn merge_cigar_ops(ops: &mut Vec<(usize, char)>) {
-    if ops.len() <= 1 {
-        return;
-    }
-
-    let mut write_idx = 0;
-    let mut current_count = ops[0].0;
-    let mut current_op = ops[0].1;
-
-    for read_idx in 1..ops.len() {
-        let (count, op) = ops[read_idx];
-        if op == current_op {
-            current_count += count;
-        } else {
-            ops[write_idx] = (current_count, current_op);
-            write_idx += 1;
-            current_count = count;
-            current_op = op;
-        }
-    }
-    ops[write_idx] = (current_count, current_op);
-    ops.truncate(write_idx + 1);
-}
-
 /// Parse CIGAR string into (length, operation) pairs
 pub(crate) fn cigar_str_to_cigar_ops(cigar: &str) -> Vec<(usize, char)> {
     let mut ops = Vec::new();
@@ -1135,26 +1099,52 @@ pub(crate) fn cigar_str_to_cigar_ops(cigar: &str) -> Vec<(usize, char)> {
     ops
 }
 
-/// Convert WFA byte array to (length, operation) pairs
-/// Treats 'M' (77) as '=' for consistency
-fn cigar_u8_to_cigar_ops(ops: &[u8]) -> Vec<(usize, char)> {
-    let mut result = Vec::new();
-    let mut count = 1;
-    let mut current_op = if ops[0] == 77 { '=' } else { ops[0] as char };
+/// Append a run, merging into the trailing op if it matches
+#[inline]
+fn push_op(out: &mut Vec<(usize, char)>, count: usize, op: char) {
+    if let Some(last) = out.last_mut() {
+        if last.1 == op {
+            last.0 += count;
+            return;
+        }
+    }
+    out.push((count, op));
+}
 
+/// Run-length encode WFA CIGAR bytes and append them into `out`
+/// Treats 'M' (77) as '=' for consistency
+fn append_cigar_u8(ops: &[u8], out: &mut Vec<(usize, char)>) {
+    if ops.is_empty() {
+        return;
+    }
+    let mut count = 1usize;
+    let mut current_op = if ops[0] == 77 { '=' } else { ops[0] as char };
     for &byte in ops.iter().skip(1) {
         let op = if byte == 77 { '=' } else { byte as char };
         if op == current_op {
             count += 1;
         } else {
-            result.push((count, current_op));
+            push_op(out, count, current_op);
             current_op = op;
             count = 1;
         }
     }
+    push_op(out, count, current_op);
+}
 
-    result.push((count, current_op));
-    result
+/// Align two sequence segments with WFA, appending the resulting ops into
+/// `out` (reuses the caller's buffer; ops are merged on append).
+pub fn align_sequences_wfa(
+    query: &[u8],
+    target: &[u8],
+    aligner: &AffineWavefronts,
+    out: &mut Vec<(usize, char)>,
+) {
+    let status = aligner.align(target, query);
+    match status {
+        AlignmentStatus::Completed => append_cigar_u8(aligner.cigar(), out),
+        s => panic!("Alignment failed with status: {s:?}"),
+    }
 }
 
 /// Format CIGAR operations as CIGAR string
@@ -1724,16 +1714,16 @@ pub fn tracepoints_to_cigar_fastga_with_aligner(
         // Handle pure insertions or deletions
         if a_end == current_a && b_end > current_b {
             // Pure deletion
-            cigar_ops.push((b_end - current_b, 'D'));
+            push_op(&mut cigar_ops, b_end - current_b, 'D');
             current_b = b_end;
         } else if b_end == current_b && a_end > current_a {
             // Pure insertion
-            cigar_ops.push((a_end - current_a, 'I'));
+            push_op(&mut cigar_ops, a_end - current_a, 'I');
             current_a = a_end;
         } else if a_end > current_a && b_end > current_b {
             // If num_diff is zero and the lengths match, it's a perfect match segment
             if num_diff == 0 && (a_end - current_a) == (b_end - current_b) {
-                cigar_ops.push((a_end - current_a, '='));
+                push_op(&mut cigar_ops, a_end - current_a, '=');
             } else {
                 // Mixed segment - realign with WFA
                 if heuristic && num_diff > 0 {
@@ -1746,19 +1736,18 @@ pub fn tracepoints_to_cigar_fastga_with_aligner(
                     );
                     aligner.set_heuristic(Some(&strategy));
                 }
-                let seg_ops = align_sequences_wfa(
+                align_sequences_wfa(
                     &a_seq[current_a..a_end],
                     &b_seq[current_b..b_end],
                     aligner,
+                    &mut cigar_ops,
                 );
-                cigar_ops.extend(seg_ops);
             }
             current_a = a_end;
             current_b = b_end;
         }
     }
 
-    merge_cigar_ops(&mut cigar_ops);
     let cigar = cigar_ops_to_cigar_string(&cigar_ops);
 
     // Reverse CIGAR for complement alignments
@@ -2948,7 +2937,8 @@ mod tests {
                 if t.is_empty() {
                     continue;
                 }
-                let cigar_ops = align_sequences_wfa(&q, &t, &aligner);
+                let mut cigar_ops = Vec::new();
+                align_sequences_wfa(&q, &t, &aligner, &mut cigar_ops);
                 let cigar = cigar_ops_to_cigar_string(&cigar_ops);
 
                 assert!(
