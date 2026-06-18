@@ -68,6 +68,8 @@ pub enum TracepointType {
     Variable,
     /// FastGA tracepoints with CIGAR processing state
     Fastga,
+    /// FastGA tracepoints storing only the target advance per segment (no diff count)
+    FastgaNoDiff,
 }
 
 impl TracepointType {
@@ -78,6 +80,7 @@ impl TracepointType {
             Self::Mixed => 1,
             Self::Variable => 2,
             Self::Fastga => 3,
+            Self::FastgaNoDiff => 4,
         }
     }
 
@@ -88,6 +91,7 @@ impl TracepointType {
             1 => Ok(Self::Mixed),
             2 => Ok(Self::Variable),
             3 => Ok(Self::Fastga),
+            4 => Ok(Self::FastgaNoDiff),
             _ => Err(format!("Invalid tracepoint type byte: {}", byte)),
         }
     }
@@ -99,7 +103,8 @@ impl TracepointType {
             "mixed" => Ok(Self::Mixed),
             "variable" => Ok(Self::Variable),
             "fastga" => Ok(Self::Fastga),
-            _ => Err(format!("Invalid tracepoint type '{}'. Expected 'standard', 'mixed', 'variable', or 'fastga'", s)),
+            "fastga-no-diff" => Ok(Self::FastgaNoDiff),
+            _ => Err(format!("Invalid tracepoint type '{}'. Expected 'standard', 'mixed', 'variable', 'fastga', or 'fastga-no-diff'", s)),
         }
     }
 
@@ -110,6 +115,7 @@ impl TracepointType {
             Self::Mixed => "mixed",
             Self::Variable => "variable",
             Self::Fastga => "fastga",
+            Self::FastgaNoDiff => "fastga-no-diff",
         }
     }
 }
@@ -121,6 +127,7 @@ pub enum TracepointData {
     Mixed(Vec<MixedRepresentation>),
     Variable(Vec<(usize, Option<usize>)>),
     Fastga(Vec<(usize, usize)>),
+    FastgaNoDiff(Vec<usize>),
 }
 
 impl TracepointData {
@@ -130,6 +137,7 @@ impl TracepointData {
             Self::Mixed(_) => TracepointType::Mixed,
             Self::Variable(_) => TracepointType::Variable,
             Self::Fastga(_) => TracepointType::Fastga,
+            Self::FastgaNoDiff(_) => TracepointType::FastgaNoDiff,
         }
     }
 
@@ -139,6 +147,11 @@ impl TracepointData {
             Self::Standard(tps) | Self::Fastga(tps) => tps
                 .iter()
                 .map(|(a, b)| format!("{},{}", a, b))
+                .collect::<Vec<_>>()
+                .join(";"),
+            Self::FastgaNoDiff(tps) => tps
+                .iter()
+                .map(|b| b.to_string())
                 .collect::<Vec<_>>()
                 .join(";"),
             Self::Variable(tps) => tps
@@ -164,6 +177,7 @@ impl TracepointData {
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Standard(tps) | Self::Fastga(tps) => tps.is_empty(),
+            Self::FastgaNoDiff(tps) => tps.is_empty(),
             Self::Variable(tps) => tps.is_empty(),
             Self::Mixed(items) => items.is_empty(),
         }
@@ -1360,6 +1374,36 @@ pub fn cigar_to_tracepoints_fastga(
     results
 }
 
+/// Convert CIGAR string into FASTGA-style tracepoints without per-segment diff counts.
+///
+/// Like `cigar_to_tracepoints_fastga`, but each segment keeps only the target advance.
+pub fn cigar_to_tracepoints_fastga_nodiff(
+    cigar: &str,
+    trace_spacing: u32,
+    query_start: usize,
+    query_end: usize,
+    query_len: usize,
+    target_start: usize,
+    target_end: usize,
+    target_len: usize,
+    complement: bool,
+) -> Vec<(Vec<usize>, (usize, usize, usize, usize))> {
+    cigar_to_tracepoints_fastga(
+        cigar,
+        trace_spacing,
+        query_start,
+        query_end,
+        query_len,
+        target_start,
+        target_end,
+        target_len,
+        complement,
+    )
+    .into_iter()
+    .map(|(seg, coords)| (seg.into_iter().map(|(_diff, b_len)| b_len).collect(), coords))
+    .collect()
+}
+
 /// Generate FASTGA-style tracepoints from CIGAR string with overflow handling
 /// It stops processing if an indel would cause tracepoint overflow.
 fn cigar_to_tracepoints_fastga_with_overflow(
@@ -1758,6 +1802,92 @@ pub fn tracepoints_to_cigar_fastga_with_aligner(
     }
 }
 
+/// Reconstruct CIGAR from diff-less FASTGA tracepoints (target advances only).
+///
+/// Like `tracepoints_to_cigar_fastga`, but without per-segment diff counts,
+/// every segment is realigned with exact (non-heuristic) WFA.
+pub fn tracepoints_to_cigar_fastga_nodiff(
+    segments: &[usize],
+    trace_spacing: u32,
+    a_seq: &[u8],
+    b_seq: &[u8],
+    a_start: usize,
+    complement: bool,
+) -> String {
+    let mut aligner = Distance::Edit.create_aligner(None, None);
+    tracepoints_to_cigar_fastga_nodiff_with_aligner(
+        segments,
+        trace_spacing,
+        a_seq,
+        b_seq,
+        a_start,
+        complement,
+        &mut aligner,
+    )
+}
+
+/// Like `tracepoints_to_cigar_fastga_nodiff`, but reuses an existing aligner.
+pub fn tracepoints_to_cigar_fastga_nodiff_with_aligner(
+    segments: &[usize],
+    trace_spacing: u32,
+    a_seq: &[u8],
+    b_seq: &[u8],
+    a_start: usize,
+    complement: bool,
+    aligner: &mut AffineWavefronts,
+) -> String {
+    let trace_spacing = trace_spacing as usize;
+
+    // Pure-match sentinel, so no realignment needed.
+    if segments.len() == 1 && segments[0] == 0 {
+        return format!("{}=", a_seq.len());
+    }
+
+    // No diff is stored, so reconstruction must be exact: clear any band the
+    // caller's aligner may carry from a previous (banded) reconstruction.
+    aligner.set_heuristic(None);
+
+    let mut cigar_ops = Vec::new();
+    let mut current_a = 0;
+    let mut current_b = 0;
+    let first_boundary = ((a_start / trace_spacing) + 1) * trace_spacing - a_start;
+
+    for (i, &b_len) in segments.iter().enumerate() {
+        let a_len = if i == 0 {
+            first_boundary.min(a_seq.len() - current_a)
+        } else {
+            trace_spacing.min(a_seq.len() - current_a)
+        };
+        let a_end = (current_a + a_len).min(a_seq.len());
+        let b_end = (current_b + b_len).min(b_seq.len());
+
+        if a_end == current_a && b_end > current_b {
+            push_op(&mut cigar_ops, b_end - current_b, 'D');
+            current_b = b_end;
+        } else if b_end == current_b && a_end > current_a {
+            push_op(&mut cigar_ops, a_end - current_a, 'I');
+            current_a = a_end;
+        } else if a_end > current_a && b_end > current_b {
+            // No stored diff: always realign exactly (no '=' shortcut, no band).
+            align_sequences_wfa(
+                &a_seq[current_a..a_end],
+                &b_seq[current_b..b_end],
+                aligner,
+                &mut cigar_ops,
+            );
+            current_a = a_end;
+            current_b = b_end;
+        }
+    }
+
+    let cigar = cigar_ops_to_cigar_string(&cigar_ops);
+    if complement {
+        reverse_cigar(&cigar)
+    } else {
+        cigar
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1770,6 +1900,9 @@ mod tests {
         let fastga = TracepointData::Fastga(vec![(1, 1)]);
         assert_eq!(fastga.to_tp_tag(), "1,1");
 
+        let fastga_nodiff = TracepointData::FastgaNoDiff(vec![5, 3, 0]);
+        assert_eq!(fastga_nodiff.to_tp_tag(), "5;3;0");
+
         let variable = TracepointData::Variable(vec![(5, None), (3, Some(2))]);
         assert_eq!(variable.to_tp_tag(), "5;3,2");
 
@@ -1779,6 +1912,47 @@ mod tests {
             MixedRepresentation::Tracepoint(1, 3),
         ]);
         assert_eq!(mixed.to_tp_tag(), "4,4;2I;1,3");
+    }
+
+    #[test]
+    fn test_fastga_nodiff_perfect_match() {
+        // Pure-match alignment encodes to the single `0` sentinel and decodes back.
+        let q = b"ACGTACGTAC";
+        let t = b"ACGTACGTAC";
+        let groups = cigar_to_tracepoints_fastga_nodiff("10=", 5, 0, 10, 10, 0, 10, 10, false);
+        assert_eq!(groups, vec![(vec![0usize], (0, 10, 0, 10))]);
+        let decoded = tracepoints_to_cigar_fastga_nodiff(&groups[0].0, 5, q, t, 0, false);
+        assert_eq!(decoded, "10=");
+    }
+
+    #[test]
+    fn test_fastga_nodiff_matches_withdiff() {
+        // The diff-less reconstruction must produce the same alignment as the
+        // with-diff one. In particular an equal-length segment containing a
+        // substitution must surface the 'X', not collapse to '='.
+        let q = b"ACGTAACGTA";
+        let t = b"ACGTTACGTA"; // single mismatch at index 4
+        let cigar = "4=1X5=";
+        let trace_spacing = 5u32;
+
+        let withdiff = cigar_to_tracepoints_fastga(
+            cigar, trace_spacing, 0, q.len(), q.len(), 0, t.len(), t.len(), false,
+        );
+        let nodiff = cigar_to_tracepoints_fastga_nodiff(
+            cigar, trace_spacing, 0, q.len(), q.len(), 0, t.len(), t.len(), false,
+        );
+        assert_eq!(withdiff.len(), nodiff.len());
+
+        // FASTGA skips the leading match run, so each group's tracepoints describe
+        // q[qs..qe] vs t[ts..te]; the decoder takes that slice plus a_start = qs.
+        for ((wseg, (qs, qe, ts, te)), (nseg, _)) in withdiff.iter().zip(nodiff.iter()) {
+            let (qs, qe, ts, te) = (*qs, *qe, *ts, *te);
+            let (a, b) = (&q[qs..qe], &t[ts..te]);
+            let wdec = tracepoints_to_cigar_fastga(wseg, trace_spacing, a, b, qs, ts, false, false);
+            let ndec = tracepoints_to_cigar_fastga_nodiff(nseg, trace_spacing, a, b, qs, false);
+            assert_eq!(ndec, wdec, "no-diff reconstruction differs from with-diff");
+            assert!(ndec.contains('X'), "mismatch lost in no-diff reconstruction: {ndec}");
+        }
     }
 
     #[test]
@@ -2980,3 +3154,5 @@ mod tests {
         let _ = &mut aligner;
     }
 }
+
+
