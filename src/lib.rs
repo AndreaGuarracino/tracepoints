@@ -127,7 +127,6 @@ pub enum TracepointData {
     Mixed(Vec<MixedRepresentation>),
     Variable(Vec<(usize, Option<usize>)>),
     Fastga(Vec<(usize, usize)>),
-    /// FastGA tracepoints storing only the target advance per segment.
     FastgaNoDiff(Vec<usize>),
 }
 
@@ -1375,13 +1374,9 @@ pub fn cigar_to_tracepoints_fastga(
     results
 }
 
-/// FASTGA tracepoints without per-segment diff counts.
+/// Convert CIGAR string into FASTGA-style tracepoints without per-segment diff counts.
 ///
-/// Same segmentation as [`cigar_to_tracepoints_fastga`], but each segment keeps
-/// only the target advance (`b_len`); the diff count is dropped, so the stored
-/// stream has one value per segment instead of two. Reconstruction must realign
-/// every segment (see [`tracepoints_to_cigar_fastga_nodiff`]). The pure-match
-/// sentinel `(0, 0)` becomes `0`.
+/// Like `cigar_to_tracepoints_fastga`, but each segment keeps only the target advance.
 pub fn cigar_to_tracepoints_fastga_nodiff(
     cigar: &str,
     trace_spacing: u32,
@@ -1809,10 +1804,8 @@ pub fn tracepoints_to_cigar_fastga_with_aligner(
 
 /// Reconstruct CIGAR from diff-less FASTGA tracepoints (target advances only).
 ///
-/// Counterpart to [`tracepoints_to_cigar_fastga`] for segments produced by
-/// [`cigar_to_tracepoints_fastga_nodiff`]. Without per-segment diff counts we
-/// cannot detect perfect-match segments or band the alignment, so every
-/// non-trivial segment is realigned exactly with WFA.
+/// Like `tracepoints_to_cigar_fastga`, but without per-segment diff counts,
+/// every segment is realigned with exact (non-heuristic) WFA.
 pub fn tracepoints_to_cigar_fastga_nodiff(
     segments: &[usize],
     trace_spacing: u32,
@@ -1833,7 +1826,7 @@ pub fn tracepoints_to_cigar_fastga_nodiff(
     )
 }
 
-/// Like [`tracepoints_to_cigar_fastga_nodiff`], but reuses an existing aligner.
+/// Like `tracepoints_to_cigar_fastga_nodiff`, but reuses an existing aligner.
 pub fn tracepoints_to_cigar_fastga_nodiff_with_aligner(
     segments: &[usize],
     trace_spacing: u32,
