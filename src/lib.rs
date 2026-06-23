@@ -1222,15 +1222,8 @@ fn skip_prefix_for_complement(
         match op {
             // Match/mismatch operations
             '=' | 'M' | 'X' => {
-                // Check if we should stop: target position must be positive
-                // (query_pos is always >= 0 for usize, so we only check target_pos)
-                if target_pos > 0 {
-                    // Found our starting point - return with full len remaining
-                    return (op_index, len, query_pos, target_pos);
-                }
-                // Consume the operation
-                query_pos += len;
-                target_pos += len;
+                // Only genuine leading gaps (handled below) are skipped.
+                return (op_index, len, query_pos, target_pos);
             }
             // Deletion - consume (advances target only)
             'D' | 'N' => {
@@ -1439,16 +1432,14 @@ fn cigar_to_tracepoints_fastga_with_overflow(
     let ops = cigar_str_to_cigar_ops(&cigar);
     let mut tracepoints = Vec::new();
 
-    // Initialize state from previous processing or start fresh
-    // For FASTGA mode: apply cigarPrefix logic to skip initial operations when target_start == 0
-    // This matches FASTGA's behavior where alignments starting at bpos=0 skip until bpos > 0
+    // Initialize state from previous processing or start fresh.
+    // When target_start == 0, skip only genuine leading gaps (matches FASTGA's cigarPrefix,
+    // fixed: the alignment start at target_pos == 0 is kept, not consumed).
     let (mut op_index, mut remaining_op_len, mut a_pos, mut b_pos) = if let Some(s) = state {
         (s.cigar_pos, s.remaining_len, s.query_pos, s.target_pos)
     } else if is_first_call && target_start == 0 {
-        // Apply cigarPrefix behavior: skip until we find a diagonal with target_pos > 0
         let result = skip_prefix_for_complement(&ops, query_start, target_start);
-        // If cigarPrefix consumed the entire CIGAR (pure-match alignment), don't skip
-        // This fixes FASTGA's PAFtoALN bug that produces 0,0 for such alignments
+        // If the skip consumed the entire CIGAR (pure-match alignment), don't skip.
         if result.0 >= ops.len() {
             (0, 0, query_start, target_start)
         } else {
