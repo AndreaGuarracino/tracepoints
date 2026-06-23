@@ -1266,15 +1266,17 @@ pub fn cigar_to_tracepoints_fastga(
     target_len: usize,
     complement: bool,
 ) -> Vec<(Vec<(usize, usize)>, (usize, usize, usize, usize))> {
+    // Parse the CIGAR ONCE.
+    let ops = {
+        let c = if complement { reverse_cigar(cigar) } else { cigar.to_string() };
+        cigar_str_to_cigar_ops(&c)
+    };
     // Pure-match alignment (only '='/'M', no mismatch or gap) represented as a single (0,0) sentinel.
-    {
-        let ops = cigar_str_to_cigar_ops(cigar);
-        if !ops.is_empty() && ops.iter().all(|&(_, op)| op == '=' || op == 'M') {
-            return vec![(
-                vec![(0, 0)],
-                (query_start, query_end, target_start, target_end),
-            )];
-        }
+    if !ops.is_empty() && ops.iter().all(|&(_, op)| op == '=' || op == 'M') {
+        return vec![(
+            vec![(0, 0)],
+            (query_start, query_end, target_start, target_end),
+        )];
     }
     let mut results = Vec::new();
     let mut state = None;
@@ -1286,7 +1288,7 @@ pub fn cigar_to_tracepoints_fastga(
 
     loop {
         let (tracepoints, new_state) = cigar_to_tracepoints_fastga_with_overflow(
-            cigar,
+            &ops,
             trace_spacing,
             current_query_start,
             query_end,
@@ -1329,17 +1331,8 @@ pub fn cigar_to_tracepoints_fastga(
         current_query_start = new_state.query_pos;
         current_target_start = new_state.target_pos;
 
-        // Skip the operation that caused overflow (similar to C code)
+        // Skip the operation that caused overflow (similar to C code).
         if new_state.remaining_len > 0 {
-            // This would be handled by the gap processing in the C code
-            // For now, we advance positions to skip the problematic operation
-            // For complement, the cigar_pos refers to the REVERSED CIGAR
-            let cigar_to_parse = if complement {
-                reverse_cigar(cigar)
-            } else {
-                cigar.to_string()
-            };
-            let ops = cigar_str_to_cigar_ops(&cigar_to_parse);
             if new_state.cigar_pos < ops.len() {
                 let (_, op) = ops[new_state.cigar_pos];
                 match op {
@@ -1400,7 +1393,7 @@ pub fn cigar_to_tracepoints_fastga_nodiff(
 /// Generate FASTGA-style tracepoints from CIGAR string with overflow handling
 /// It stops processing if an indel would cause tracepoint overflow.
 fn cigar_to_tracepoints_fastga_with_overflow(
-    cigar: &str,
+    ops: &[(usize, char)],
     trace_spacing: u32,
     query_start: usize,
     query_end: usize,
@@ -1412,24 +1405,15 @@ fn cigar_to_tracepoints_fastga_with_overflow(
 ) -> (Vec<(usize, usize)>, CigarProcessingState) {
     let trace_spacing = trace_spacing as usize;
 
-    // FASTGA reverses the target coordinates and CIGAR for complement alignments
-    // BUT only on the first call (state is None). On continuation calls, coordinates
-    // are already in reversed space.
+    // CIGAR is pre-parsed once by the caller (already reversed for complement). Here we only
+    // reverse the target COORDINATES on the first call; the ops are resumed by op-index via `state`.
     let is_first_call = state.is_none();
-    let (target_start, target_end, cigar) = if complement && is_first_call {
-        (
-            target_len - target_end,
-            target_len - target_start,
-            reverse_cigar(cigar),
-        )
-    } else if complement {
-        // Continuation: coordinates already reversed, but still need reversed CIGAR
-        (target_start, target_end, reverse_cigar(cigar))
+    let (target_start, target_end) = if complement && is_first_call {
+        (target_len - target_end, target_len - target_start)
     } else {
-        (target_start, target_end, cigar.to_string())
+        (target_start, target_end)
     };
 
-    let ops = cigar_str_to_cigar_ops(&cigar);
     let mut tracepoints = Vec::new();
 
     // Initialize state from previous processing or start fresh.
