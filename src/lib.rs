@@ -1764,15 +1764,11 @@ pub fn cigar_to_tracepoints_fastga_with_contigs(
             if tps.len() == 1 && tps[0] == (0, 0) {
                 continue;
             }
-            // Re-base contig-local coords back to scaffold: add the query/target contig starts.
-            // For '-' strand the target is in RC space, so convert (ta,tb) back to forward.
+            // Re-base contig-local coords back to scaffold by adding the contig starts. Target stays
+            // in RC space for '-' (same convention as cigar_to_tracepoints_fastga); the caller does the
+            // single RC->forward conversion, so don't flip here or it double-converts.
             let (ta, tb) = (ta + p.tsbeg, tb + p.tsbeg);
-            let (fta, ftb) = if complement {
-                (target_len - tb, target_len - ta)
-            } else {
-                (ta, tb)
-            };
-            results.push((tps, (qa + p.qsbeg, qb + p.qsbeg, fta, ftb)));
+            results.push((tps, (qa + p.qsbeg, qb + p.qsbeg, ta, tb)));
         }
     }
     results
@@ -2131,8 +2127,14 @@ pub fn tracepoints_to_cigar_fastga_with_aligner(
             push_op(&mut cigar_ops, a_end - current_a, 'I');
             current_a = a_end;
         } else if a_end > current_a && b_end > current_b {
-            // If num_diff is zero and the lengths match, it's a perfect match segment
-            if num_diff == 0 && (a_end - current_a) == (b_end - current_b) {
+            // Fast path: num_diff==0 with equal lengths is usually a pure-match cell. We can't trust the
+            // diff count alone, though: in contig/overflow boundary-crossing pieces FASTGA normalizes the
+            // indel to the piece boundary, which shifts the grid so a cell's stored b_len pairs with a
+            // different query range, leaving diff==0 cells that are not pure matches.
+            let pure_match = num_diff == 0
+                && (a_end - current_a) == (b_end - current_b)
+                && a_seq[current_a..a_end].eq_ignore_ascii_case(&b_seq[current_b..b_end]);
+            if pure_match {
                 push_op(&mut cigar_ops, a_end - current_a, '=');
             } else {
                 // Mixed segment - realign with WFA
