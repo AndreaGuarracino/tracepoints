@@ -1098,16 +1098,21 @@ fn reverse_cigar(cigar: &str) -> String {
 
 /// Parse CIGAR string into (length, operation) pairs
 pub(crate) fn cigar_str_to_cigar_ops(cigar: &str) -> Vec<(usize, char)> {
-    let mut ops = Vec::new();
-    let mut num = String::new();
-    for ch in cigar.chars() {
-        if ch.is_ascii_digit() {
-            num.push(ch);
+    let bytes = cigar.as_bytes();
+    // Each op is >=2 bytes (digits + letter), so len/2 is a safe upper bound: reserve to avoid regrows.
+    let mut ops = Vec::with_capacity(bytes.len() / 2 + 1);
+    let mut n: usize = 0;
+    let mut have_digit = false;
+    for &b in bytes {
+        if b.is_ascii_digit() {
+            n = n * 10 + (b - b'0') as usize; // accumulate inline; no String + parse per op
+            have_digit = true;
         } else {
-            if let Ok(n) = num.parse::<usize>() {
-                ops.push((n, ch));
+            if have_digit {
+                ops.push((n, b as char));
             }
-            num.clear();
+            n = 0;
+            have_digit = false;
         }
     }
     ops
