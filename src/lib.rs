@@ -1098,16 +1098,21 @@ fn reverse_cigar(cigar: &str) -> String {
 
 /// Parse CIGAR string into (length, operation) pairs
 pub(crate) fn cigar_str_to_cigar_ops(cigar: &str) -> Vec<(usize, char)> {
-    let mut ops = Vec::new();
-    let mut num = String::new();
-    for ch in cigar.chars() {
-        if ch.is_ascii_digit() {
-            num.push(ch);
+    let bytes = cigar.as_bytes();
+    // Each op is >=2 bytes (digits + letter), so len/2 is a safe upper bound: reserve to avoid regrows.
+    let mut ops = Vec::with_capacity(bytes.len() / 2 + 1);
+    let mut n: usize = 0;
+    let mut have_digit = false;
+    for &b in bytes {
+        if b.is_ascii_digit() {
+            n = n * 10 + (b - b'0') as usize; // accumulate inline; no String + parse per op
+            have_digit = true;
         } else {
-            if let Ok(n) = num.parse::<usize>() {
-                ops.push((n, ch));
+            if have_digit {
+                ops.push((n, b as char));
             }
-            num.clear();
+            n = 0;
+            have_digit = false;
         }
     }
     ops
@@ -1266,13 +1271,42 @@ pub fn cigar_to_tracepoints_fastga(
     target_len: usize,
     complement: bool,
 ) -> Vec<(Vec<(usize, usize)>, (usize, usize, usize, usize))> {
+    cigar_to_tracepoints_fastga_core(
+        cigar,
+        trace_spacing,
+        query_start,
+        query_end,
+        _query_len,
+        target_start,
+        target_end,
+        target_len,
+        complement,
+        true,
+    )
+}
+
+/// Core FASTGA tracepoint generator. `pure_match_sentinel`: collapse an all-'='/'M' CIGAR to a single
+/// (0,0); valid only for a WHOLE alignment, so per-contig sub-pieces pass false.
+#[allow(clippy::too_many_arguments)]
+fn cigar_to_tracepoints_fastga_core(
+    cigar: &str,
+    trace_spacing: u32,
+    query_start: usize,
+    query_end: usize,
+    _query_len: usize,
+    target_start: usize,
+    target_end: usize,
+    target_len: usize,
+    complement: bool,
+    pure_match_sentinel: bool,
+) -> Vec<(Vec<(usize, usize)>, (usize, usize, usize, usize))> {
     // Parse the CIGAR ONCE.
     let ops = {
         let c = if complement { reverse_cigar(cigar) } else { cigar.to_string() };
         cigar_str_to_cigar_ops(&c)
     };
     // Pure-match alignment (only '='/'M', no mismatch or gap) represented as a single (0,0) sentinel.
-    if !ops.is_empty() && ops.iter().all(|&(_, op)| op == '=' || op == 'M') {
+    if pure_match_sentinel && !ops.is_empty() && ops.iter().all(|&(_, op)| op == '=' || op == 'M') {
         return vec![(
             vec![(0, 0)],
             (query_start, query_end, target_start, target_end),
@@ -1346,8 +1380,21 @@ pub fn cigar_to_tracepoints_fastga(
             }
         }
 
+        // cigarPrefix: skip the next segment's leading indels (FASTGA does this after every split, so
+        // a "105D 78I" gap is fully skipped).
+        let mut next_pos = new_state.cigar_pos + 1;
+        while next_pos < ops.len() && matches!(ops[next_pos].1, 'I' | 'D') {
+            let (n, op) = ops[next_pos];
+            if op == 'I' {
+                current_query_start += n;
+            } else {
+                current_target_start += n;
+            }
+            next_pos += 1;
+        }
+
         state = Some(CigarProcessingState {
-            cigar_pos: new_state.cigar_pos + 1, // Move to next operation
+            cigar_pos: next_pos, // start of next segment
             remaining_len: 0,
             query_pos: current_query_start,
             target_pos: current_target_start,
@@ -1355,6 +1402,16 @@ pub fn cigar_to_tracepoints_fastga(
             actual_query_start: current_query_start,
             actual_target_start: current_target_start,
         });
+    }
+
+    // PAFtoALN stores tracepoints as uint8 pairs, so a per-interval value >=256 wraps mod 256. This is
+    // valid only while b-advance < 256 (trace_spacing < 128); replicate the wrap there, keep full above.
+    if trace_spacing < 128 {
+        for (seg, _) in results.iter_mut() {
+            for tp in seg.iter_mut() {
+                *tp = (tp.0 & 0xFF, tp.1 & 0xFF);
+            }
+        }
     }
 
     results
@@ -1388,6 +1445,333 @@ pub fn cigar_to_tracepoints_fastga_nodiff(
     .into_iter()
     .map(|(seg, coords)| (seg.into_iter().map(|(_diff, b_len)| b_len).collect(), coords))
     .collect()
+}
+
+// Contig (ACGT run) FASTGA assigns to scaffold pos `p`: first contig with send > p (PAFtoALN.c).
+// If `p` is in an N-gap this is the NEXT contig, so contig-local pos goes negative (cigarPrefix clamps).
+fn contig_index_of(p: usize, contigs: &[(usize, usize)]) -> usize {
+    for (i, &(_, e)) in contigs.iter().enumerate() {
+        if p < e {
+            return i;
+        }
+    }
+    contigs.len().saturating_sub(1)
+}
+
+// FASTGA cigarPrefix (PAFtoALN.c): skip the next piece's leading indels and clamp a leading
+// diagonal op straddling into the contig (keep its in-contig prefix, advance target by the rest).
+fn cigar_prefix_walk(
+    ops: &[(usize, char)],
+    i: &mut usize,
+    rem: &mut usize,
+    apos: &mut isize,
+    bpos: &mut isize,
+) {
+    while *i < ops.len() {
+        let (_, op) = ops[*i];
+        let len = *rem as isize;
+        match op {
+            '=' | 'X' | 'M' => {
+                // Mirror PAFtoALN.c. Quirk: a clamp to len 0 leaves the cursor on the op letter;
+                // cigar2tp re-reads, finds no digits, defaults len=1 -> the piece keeps 1 base of the
+                // clamped diagonal. `rem` mirrors FASTGA's `len`.
+                if *apos >= 0 && *bpos >= 0 {
+                    return;
+                }
+                if *apos < 0 && *apos + len >= 0 {
+                    let dropped = (-*apos) as usize; // len += apos
+                    *rem -= dropped;
+                    *bpos += -*apos; // bpos -= apos
+                    *apos = 0;
+                    if *bpos >= 0 {
+                        if *rem == 0 {
+                            *rem = 1;
+                        }
+                        return;
+                    }
+                }
+                // FASTGA's `len` was updated by the apos clamp above (PAFtoALN.c); use the
+                // current `rem` for the bpos check so the two clamps compose like the C code.
+                let len = *rem as isize;
+                if *bpos < 0 && *bpos + len >= 0 {
+                    let dropped = (-*bpos) as usize; // len += bpos
+                    *rem -= dropped;
+                    *apos += -*bpos; // apos -= bpos
+                    *bpos = 0;
+                    if *apos >= 0 {
+                        if *rem == 0 {
+                            *rem = 1;
+                        }
+                        return;
+                    }
+                }
+                // Whole op is still off the matrix (apos<0 and/or bpos<0): consume the REMAINING
+                // length (PAFtoALN.c). `rem` was reduced by either clamp above, so use it
+                // (NOT the stale pre-clamp `len`) to avoid double-advancing a partially-clamped op.
+                let len = *rem as isize;
+                *apos += len;
+                *bpos += len;
+            }
+            'D' | 'N' => *bpos += len,
+            'I' => *apos += len,
+            _ => {}
+        }
+        *i += 1;
+        *rem = if *i < ops.len() { ops[*i].0 } else { 0 };
+    }
+}
+
+// A per-contig piece: contig-local query [qs,qe), contig-local target [ts,te), body CIGAR ops, and
+// the query/target scaffold contig starts (qsbeg/tsbeg) used by the caller to rebase coordinates.
+struct ContigPiece {
+    qstart: usize,
+    qend: usize,
+    tstart: usize,
+    tend: usize,
+    ops: Vec<(usize, char)>,
+    qsbeg: usize,
+    tsbeg: usize,
+}
+
+// Split an alignment at query AND target N-gap boundaries into per-contig pieces, replicating
+// FASTGA's gen_1aln + cigarPrefix. Walks the cigar with contig-local query (`apos`) and target
+// (`bpos`) positions that reset across contigs; a piece ends when apos reaches aend OR bpos reaches
+// bend. Leading indels of the next piece are skipped and a straddling leading diagonal is clamped.
+// `qcontigs`/`tcontigs` = sorted ACGT runs (sbeg,send) in walk space (forward for '+', RC for '-');
+// empty = single contig. `qs`/`ts` are the walk-space starts.
+fn split_query_contig_pieces(
+    ops: &[(usize, char)],
+    qs: usize,
+    qe: usize,
+    ts: usize,
+    qcontigs: &[(usize, usize)],
+    tcontigs: &[(usize, usize)],
+) -> Vec<ContigPiece> {
+    let _ = qe;
+    let mut pieces = Vec::new();
+
+    // FASTGA initial state: apos = qs - (its contig start), negative if in a gap; target likewise.
+    // With no contig table, treat as one contig spanning [start, +inf) so boundary checks never fire.
+    let q_single = qcontigs.is_empty();
+    let t_single = tcontigs.is_empty();
+    let mut aread = if q_single { 0 } else { contig_index_of(qs, qcontigs) };
+    let mut bread = if t_single { 0 } else { contig_index_of(ts, tcontigs) };
+    let q_sbeg0 = if q_single { qs } else { qcontigs[aread].0 };
+    let t_sbeg0 = if t_single { ts } else { tcontigs[bread].0 };
+    let mut apos: isize = qs as isize - q_sbeg0 as isize;
+    let mut bpos: isize = ts as isize - t_sbeg0 as isize;
+    let mut aend: isize = if q_single {
+        isize::MAX
+    } else {
+        (qcontigs[aread].1 - qcontigs[aread].0) as isize
+    };
+    let mut bend: isize = if t_single {
+        isize::MAX
+    } else {
+        (tcontigs[bread].1 - tcontigs[bread].0) as isize
+    };
+    let mut q_base: isize = q_sbeg0 as isize; // scaffold/RC value of contig-local query 0
+    let mut t_base: isize = t_sbeg0 as isize;
+
+    let (mut i, mut rem) = (0usize, if ops.is_empty() { 0 } else { ops[0].0 });
+
+    cigar_prefix_walk(ops, &mut i, &mut rem, &mut apos, &mut bpos); // initial skip (PAFtoALN.c)
+
+    loop {
+        if i >= ops.len() {
+            break;
+        }
+        let qsbeg = q_base as usize;
+        let tsbeg = t_base as usize;
+        let p_qstart = apos.max(0) as usize;
+        let p_tstart = bpos.max(0) as usize;
+        let mut body: Vec<(usize, char)> = Vec::new();
+
+        // Walk until apos reaches aend OR bpos reaches bend (cigar2tp stop, PAFtoALN.c),
+        // splitting the op that crosses whichever contig end comes first.
+        loop {
+            if i >= ops.len() || apos >= aend || bpos >= bend {
+                break;
+            }
+            let (_, op) = ops[i];
+            let qcons = matches!(op, '=' | 'X' | 'M' | 'I');
+            let tcons = matches!(op, '=' | 'X' | 'M' | 'D' | 'N');
+            let len = rem as isize;
+            // Clip the op so it stops exactly at the first contig end it would cross.
+            let mut step = rem;
+            if qcons && apos + len > aend {
+                step = step.min((aend - apos) as usize);
+            }
+            if tcons && bpos + (step as isize) > bend {
+                step = step.min((bend - bpos) as usize);
+            }
+            if step > 0 {
+                body.push((step, op));
+            }
+            if qcons {
+                apos += step as isize;
+            }
+            if tcons {
+                bpos += step as isize;
+            }
+            rem -= step;
+            if rem == 0 {
+                i += 1;
+                rem = if i < ops.len() { ops[i].0 } else { 0 };
+            }
+            if apos >= aend || bpos >= bend {
+                break;
+            }
+        }
+
+        let qcon: usize = body
+            .iter()
+            .filter(|(_, o)| matches!(o, '=' | 'X' | 'M' | 'I'))
+            .map(|(n, _)| *n)
+            .sum();
+        let tcon: usize = body
+            .iter()
+            .filter(|(_, o)| matches!(o, '=' | 'X' | 'M' | 'D' | 'N'))
+            .map(|(n, _)| *n)
+            .sum();
+        // FASTGA emits an overlap per gen_1aln iteration, including zero-span pieces (when cigarPrefix
+        // consumed a whole inter-contig gap). Those carry no alignment (ALNtoPAF renders them as empty
+        // records), so we drop them and keep only pieces with query or target content.
+        if qcon > 0 || tcon > 0 {
+            pieces.push(ContigPiece {
+                qstart: p_qstart,
+                qend: p_qstart + qcon,
+                tstart: p_tstart,
+                tend: p_tstart + tcon,
+                ops: body,
+                qsbeg,
+                tsbeg,
+            });
+        }
+
+        if i >= ops.len() {
+            break;
+        }
+
+        // Inter-piece transition (PAFtoALN.c): consume a single split indel, advance the
+        // query/target contigs, then cigarPrefix the next piece.
+        let (_, op) = ops[i];
+        if op == 'I' {
+            apos += rem as isize;
+            i += 1;
+            rem = if i < ops.len() { ops[i].0 } else { 0 };
+        } else if op == 'D' || op == 'N' {
+            bpos += rem as isize;
+            i += 1;
+            rem = if i < ops.len() { ops[i].0 } else { 0 };
+        }
+        while !q_single && apos >= aend && aread + 1 < qcontigs.len() {
+            let sbeg_old = qcontigs[aread].0 as isize;
+            aread += 1;
+            apos += sbeg_old - qcontigs[aread].0 as isize;
+            aend = (qcontigs[aread].1 - qcontigs[aread].0) as isize;
+            q_base = qcontigs[aread].0 as isize;
+        }
+        while !t_single && bpos >= bend && bread + 1 < tcontigs.len() {
+            let sbeg_old = tcontigs[bread].0 as isize;
+            bread += 1;
+            bpos += sbeg_old - tcontigs[bread].0 as isize;
+            bend = (tcontigs[bread].1 - tcontigs[bread].0) as isize;
+            t_base = tcontigs[bread].0 as isize;
+        }
+        if apos >= aend || bpos >= bend {
+            break; // terminal end-gap at scaffold edge (PAFtoALN.c)
+        }
+        cigar_prefix_walk(ops, &mut i, &mut rem, &mut apos, &mut bpos);
+    }
+
+    if std::env::var("SPLITDBG").is_ok() {
+        for (k, p) in pieces.iter().enumerate() {
+            let head: String = p.ops.iter().take(5).map(|(n, o)| format!("{}{}", n, o)).collect();
+            eprintln!(
+                "PIECE {} qloc=[{},{})+{} tloc=[{},{})+{} nops={} head={}",
+                k, p.qstart, p.qend, p.qsbeg, p.tstart, p.tend, p.tsbeg, p.ops.len(), head
+            );
+        }
+    }
+    pieces
+}
+
+/// Contig-aware FASTGA tracepoints (byte-identical to PAFtoALN on gapped assemblies, both strands):
+/// splits at query AND target N-gap boundaries and emits tracepoints per piece. `query_contigs`/
+/// `target_contigs` = sorted ACGT runs of each scaffold; pass an empty slice when there are no N-gaps.
+pub fn cigar_to_tracepoints_fastga_with_contigs(
+    cigar: &str,
+    trace_spacing: u32,
+    query_start: usize,
+    query_end: usize,
+    query_len: usize,
+    target_start: usize,
+    target_end: usize,
+    target_len: usize,
+    complement: bool,
+    query_contigs: &[(usize, usize)],
+    target_contigs: &[(usize, usize)],
+) -> Vec<(Vec<(usize, usize)>, (usize, usize, usize, usize))> {
+    let ops = cigar_str_to_cigar_ops(cigar);
+    // No whole-pure-match (0,0) shortcut: FASTGA only emits (0,0) when cigarPrefix consumes an all-indel
+    // CIGAR; a real pure-match (e.g. "1=") walks normally to literal tracepoints. So route it per-piece.
+
+    // FASTGA walks the query FORWARD for both strands. For '-' it reverses the whole CIGAR (cigarCheck)
+    // into query-forward / RC-target-forward order and walks target contigs in reverse (bread--). We
+    // mirror this: reverse the ops, map the target to RC space (contig (s,e) -> (target_len-e,
+    // target_len-s); window start -> target_len-target_end), then walk as '+' and convert coords back.
+    let (ops, t_lo) = if complement {
+        (
+            ops.iter().rev().cloned().collect::<Vec<_>>(),
+            target_len - target_end,
+        )
+    } else {
+        (ops, target_start)
+    };
+    let tcontigs_walk: Vec<(usize, usize)> = if complement {
+        let mut v: Vec<(usize, usize)> = target_contigs
+            .iter()
+            .map(|&(s, e)| (target_len - e, target_len - s))
+            .collect();
+        v.sort_unstable();
+        v
+    } else {
+        target_contigs.to_vec()
+    };
+
+    let pieces = split_query_contig_pieces(
+        &ops,
+        query_start,
+        query_end,
+        t_lo,
+        query_contigs,
+        &tcontigs_walk,
+    );
+    let mut results = Vec::new();
+    for p in pieces {
+        let pc: String = p.ops.iter().map(|(n, o)| format!("{}{}", n, o)).collect();
+        // complement=false: the CIGAR is already in forward-walk order and the target is already
+        // expressed in RC space, so the inner encoder must NOT reverse or flip anything. The piece
+        // coords are contig-local; the inner trace b-advances are contig-local too.
+        // pure_match_sentinel=false: a pure-'=' sub-piece off the trace grid still emits real grid
+        // tracepoints (FASTGA only collapses a WHOLE pure-match alignment to a (0,0)).
+        for (tps, (qa, qb, ta, tb)) in cigar_to_tracepoints_fastga_core(
+            &pc, trace_spacing, p.qstart, p.qend, query_len, p.tstart, p.tend, target_len, false,
+            false,
+        ) {
+            // FASTGA does not emit a (0,0) sentinel for sub-pieces (only whole pure-match alignments)
+            if tps.len() == 1 && tps[0] == (0, 0) {
+                continue;
+            }
+            // Re-base contig-local coords back to scaffold by adding the contig starts. Target stays
+            // in RC space for '-' (same convention as cigar_to_tracepoints_fastga); the caller does the
+            // single RC->forward conversion, so don't flip here or it double-converts.
+            let (ta, tb) = (ta + p.tsbeg, tb + p.tsbeg);
+            results.push((tps, (qa + p.qsbeg, qb + p.qsbeg, ta, tb)));
+        }
+    }
+    results
 }
 
 /// Generate FASTGA-style tracepoints from CIGAR string with overflow handling
@@ -1451,8 +1835,11 @@ fn cigar_to_tracepoints_fastga_with_overflow(
         };
         remaining_op_len = 0;
 
-        // Check boundaries before processing
-        if a_pos >= query_end || b_pos >= target_end {
+        // Check boundaries before processing. Stop only when BOTH query and target are consumed:
+        // a trailing query-only (I) or target-only (D) op at the end leaves one coord at its bound
+        // while the other still advances, and FASTGA's cigar2tp (bounded by contig length, not the
+        // alignment end) processes it — so we must too, or the final window's diff is short by the indel.
+        if a_pos >= query_end && b_pos >= target_end {
             if a_pos > next_trace - trace_spacing {
                 tracepoints.push((
                     (diff - last_diff).unsigned_abs() as usize,
@@ -1740,8 +2127,14 @@ pub fn tracepoints_to_cigar_fastga_with_aligner(
             push_op(&mut cigar_ops, a_end - current_a, 'I');
             current_a = a_end;
         } else if a_end > current_a && b_end > current_b {
-            // If num_diff is zero and the lengths match, it's a perfect match segment
-            if num_diff == 0 && (a_end - current_a) == (b_end - current_b) {
+            // Fast path: num_diff==0 with equal lengths is usually a pure-match cell. We can't trust the
+            // diff count alone, though: in contig/overflow boundary-crossing pieces FASTGA normalizes the
+            // indel to the piece boundary, which shifts the grid so a cell's stored b_len pairs with a
+            // different query range, leaving diff==0 cells that are not pure matches.
+            let pure_match = num_diff == 0
+                && (a_end - current_a) == (b_end - current_b)
+                && a_seq[current_a..a_end].eq_ignore_ascii_case(&b_seq[current_b..b_end]);
+            if pure_match {
                 push_op(&mut cigar_ops, a_end - current_a, '=');
             } else {
                 // Mixed segment - realign with WFA
