@@ -1300,10 +1300,11 @@ fn cigar_to_tracepoints_fastga_core(
     complement: bool,
     pure_match_sentinel: bool,
 ) -> Vec<(Vec<(usize, usize)>, (usize, usize, usize, usize))> {
-    // Parse the CIGAR ONCE.
-    let ops = {
-        let c = if complement { reverse_cigar(cigar) } else { cigar.to_string() };
-        cigar_str_to_cigar_ops(&c)
+    // Parse the CIGAR ONCE. For '+' parse the input directly; only '-' needs the reversed copy.
+    let ops = if complement {
+        cigar_str_to_cigar_ops(&reverse_cigar(cigar))
+    } else {
+        cigar_str_to_cigar_ops(cigar)
     };
     // Pure-match alignment (only '='/'M', no mismatch or gap) represented as a single (0,0) sentinel.
     if pure_match_sentinel && !ops.is_empty() && ops.iter().all(|&(_, op)| op == '=' || op == 'M') {
