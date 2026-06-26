@@ -210,6 +210,18 @@ pub fn cigar_to_tracepoints(
     }
 }
 
+/// Convert pre-parsed CIGAR ops into standard tracepoints
+pub fn cigar_to_tracepoints_from_ops(
+    ops: &[(usize, char)],
+    max_value: u32,
+    metric: ComplexityMetric,
+) -> Vec<(usize, usize)> {
+    match process_cigar_segments_ops(ops, max_value as usize, false, false, metric) {
+        TracepointData::Standard(tracepoints) => tracepoints,
+        _ => unreachable!(),
+    }
+}
+
 /// Convert CIGAR string into raw standard tracepoints
 ///
 /// Like `cigar_to_tracepoints` but allows indels to be split across segments.
@@ -629,16 +641,27 @@ fn process_cigar_segments(
     allow_indel_split: bool,
     metric: ComplexityMetric,
 ) -> TracepointData {
+    let ops = cigar_str_to_cigar_ops(cigar);
+    process_cigar_segments_ops(&ops, max_value, preserve_special, allow_indel_split, metric)
+}
+
+fn process_cigar_segments_ops(
+    ops: &[(usize, char)],
+    max_value: usize,
+    preserve_special: bool,
+    allow_indel_split: bool,
+    metric: ComplexityMetric,
+) -> TracepointData {
     match metric {
         ComplexityMetric::EditDistance => {
-            process_cigar_edit_distance(cigar, max_value, preserve_special, allow_indel_split)
+            process_cigar_edit_distance(ops, max_value, preserve_special, allow_indel_split)
         }
         ComplexityMetric::DiagonalDistance => {
             debug_assert!(
                 !allow_indel_split,
                 "allow_indel_split is ignored when using diagonal metric"
             );
-            process_cigar_diagonal_distance(cigar, max_value, preserve_special)
+            process_cigar_diagonal_distance(ops, max_value, preserve_special)
         }
     }
 }
@@ -649,19 +672,18 @@ fn process_cigar_segments(
 /// Special operations (H, N, P, S) are preserved when preserve_special is true.
 /// Indels can be split across segments when allow_indel_split is true (raw mode).
 fn process_cigar_edit_distance(
-    cigar: &str,
+    ops: &[(usize, char)],
     max_diff: usize,
     preserve_special: bool,
     allow_indel_split: bool,
 ) -> TracepointData {
-    let ops = cigar_str_to_cigar_ops(cigar);
     let mut standard_tracepoints = Vec::new();
     let mut mixed_tracepoints = Vec::new();
     let mut cur_a_len = 0;
     let mut cur_b_len = 0;
     let mut cur_diff = 0;
 
-    for (mut len, op) in ops {
+    for &(mut len, op) in ops {
         match op {
             'H' | 'N' | 'P' | 'S' if preserve_special => {
                 flush_segment(
@@ -802,18 +824,17 @@ fn process_cigar_edit_distance(
 /// Insertions increase diagonal distance (+), deletions decrease it (-).
 /// The main diagonal is influenced by the overall sequence length difference.
 fn process_cigar_diagonal_distance(
-    cigar: &str,
+    ops: &[(usize, char)],
     max_dist: usize,
     preserve_special: bool,
 ) -> TracepointData {
-    let ops = cigar_str_to_cigar_ops(cigar);
     let mut standard_tracepoints = Vec::new();
     let mut mixed_tracepoints = Vec::new();
     let mut cur_a_len = 0;
     let mut cur_b_len = 0;
     let mut diagonal_distance: i64 = 0;
 
-    for (len, op) in ops {
+    for &(len, op) in ops {
         match op {
             'H' | 'N' | 'P' | 'S' if preserve_special => {
                 flush_segment(
@@ -1097,7 +1118,7 @@ fn reverse_cigar(cigar: &str) -> String {
 }
 
 /// Parse CIGAR string into (length, operation) pairs
-pub(crate) fn cigar_str_to_cigar_ops(cigar: &str) -> Vec<(usize, char)> {
+pub fn cigar_str_to_cigar_ops(cigar: &str) -> Vec<(usize, char)> {
     let bytes = cigar.as_bytes();
     // Each op is >=2 bytes (digits + letter), so len/2 is a safe upper bound: reserve to avoid regrows.
     let mut ops = Vec::with_capacity(bytes.len() / 2 + 1);
@@ -1293,7 +1314,7 @@ fn cigar_to_tracepoints_fastga_core(
     trace_spacing: u32,
     query_start: usize,
     query_end: usize,
-    _query_len: usize,
+    query_len: usize,
     target_start: usize,
     target_end: usize,
     target_len: usize,
@@ -1306,6 +1327,34 @@ fn cigar_to_tracepoints_fastga_core(
     } else {
         cigar_str_to_cigar_ops(cigar)
     };
+    cigar_to_tracepoints_fastga_core_ops(
+        &ops,
+        trace_spacing,
+        query_start,
+        query_end,
+        query_len,
+        target_start,
+        target_end,
+        target_len,
+        complement,
+        pure_match_sentinel,
+    )
+}
+
+/// Same as `cigar_to_tracepoints_fastga_core` but takes already-parsed ops.
+#[allow(clippy::too_many_arguments)]
+fn cigar_to_tracepoints_fastga_core_ops(
+    ops: &[(usize, char)],
+    trace_spacing: u32,
+    query_start: usize,
+    query_end: usize,
+    _query_len: usize,
+    target_start: usize,
+    target_end: usize,
+    target_len: usize,
+    complement: bool,
+    pure_match_sentinel: bool,
+) -> Vec<(Vec<(usize, usize)>, (usize, usize, usize, usize))> {
     // Pure-match alignment (only '='/'M', no mismatch or gap) represented as a single (0,0) sentinel.
     if pure_match_sentinel && !ops.is_empty() && ops.iter().all(|&(_, op)| op == '=' || op == 'M') {
         return vec![(
@@ -1323,7 +1372,7 @@ fn cigar_to_tracepoints_fastga_core(
 
     loop {
         let (tracepoints, new_state) = cigar_to_tracepoints_fastga_with_overflow(
-            &ops,
+            ops,
             trace_spacing,
             current_query_start,
             query_end,
@@ -1587,6 +1636,8 @@ fn split_query_contig_pieces(
         let p_qstart = apos.max(0) as usize;
         let p_tstart = bpos.max(0) as usize;
         let mut body: Vec<(usize, char)> = Vec::new();
+        // Accumulate query/target consumption during the walk (avoids two extra sum-passes over body).
+        let (mut qcon, mut tcon) = (0usize, 0usize);
 
         // Walk until apos reaches aend OR bpos reaches bend (cigar2tp stop, PAFtoALN.c),
         // splitting the op that crosses whichever contig end comes first.
@@ -1611,9 +1662,11 @@ fn split_query_contig_pieces(
             }
             if qcons {
                 apos += step as isize;
+                qcon += step;
             }
             if tcons {
                 bpos += step as isize;
+                tcon += step;
             }
             rem -= step;
             if rem == 0 {
@@ -1625,16 +1678,6 @@ fn split_query_contig_pieces(
             }
         }
 
-        let qcon: usize = body
-            .iter()
-            .filter(|(_, o)| matches!(o, '=' | 'X' | 'M' | 'I'))
-            .map(|(n, _)| *n)
-            .sum();
-        let tcon: usize = body
-            .iter()
-            .filter(|(_, o)| matches!(o, '=' | 'X' | 'M' | 'D' | 'N'))
-            .map(|(n, _)| *n)
-            .sum();
         // FASTGA emits an overlap per gen_1aln iteration, including zero-span pieces (when cigarPrefix
         // consumed a whole inter-contig gap). Those carry no alignment (ALNtoPAF renders them as empty
         // records), so we drop them and keep only pieces with query or target content.
@@ -1751,14 +1794,13 @@ pub fn cigar_to_tracepoints_fastga_with_contigs(
     );
     let mut results = Vec::new();
     for p in pieces {
-        let pc: String = p.ops.iter().map(|(n, o)| format!("{}{}", n, o)).collect();
         // complement=false: the CIGAR is already in forward-walk order and the target is already
         // expressed in RC space, so the inner encoder must NOT reverse or flip anything. The piece
         // coords are contig-local; the inner trace b-advances are contig-local too.
         // pure_match_sentinel=false: a pure-'=' sub-piece off the trace grid still emits real grid
         // tracepoints (FASTGA only collapses a WHOLE pure-match alignment to a (0,0)).
-        for (tps, (qa, qb, ta, tb)) in cigar_to_tracepoints_fastga_core(
-            &pc, trace_spacing, p.qstart, p.qend, query_len, p.tstart, p.tend, target_len, false,
+        for (tps, (qa, qb, ta, tb)) in cigar_to_tracepoints_fastga_core_ops(
+            &p.ops, trace_spacing, p.qstart, p.qend, query_len, p.tstart, p.tend, target_len, false,
             false,
         ) {
             // FASTGA does not emit a (0,0) sentinel for sub-pieces (only whole pure-match alignments)
