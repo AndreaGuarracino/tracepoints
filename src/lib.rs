@@ -1522,9 +1522,9 @@ fn cigar_prefix_walk(
         let len = *rem as isize;
         match op {
             '=' | 'X' | 'M' => {
-                // Mirror PAFtoALN.c. Quirk: a clamp to len 0 leaves the cursor on the op letter;
-                // cigar2tp re-reads, finds no digits, defaults len=1 -> the piece keeps 1 base of the
-                // clamped diagonal. `rem` mirrors FASTGA's `len`.
+                // Mirror PAFtoALN.c cigarPrefix (post-fix): if a clamp consumes the whole diagonal op
+                // (rem -> 0), the op lies entirely in the N-gap, so skip it (advance cursor) rather than
+                // keeping a phantom base. `rem` mirrors FASTGA's `len`.
                 if *apos >= 0 && *bpos >= 0 {
                     return;
                 }
@@ -1533,10 +1533,9 @@ fn cigar_prefix_walk(
                     *rem -= dropped;
                     *bpos += -*apos; // bpos -= apos
                     *apos = 0;
-                    if *bpos >= 0 {
-                        if *rem == 0 {
-                            *rem = 1;
-                        }
+                    if *bpos >= 0 && *rem > 0 {
+                        // rem==0: op fully in the gap; skip it (advance cursor) instead of
+                        // parking on a 0-length op. Mirrors PAFtoALN.c cigarPrefix `&& len > 0` fix.
                         return;
                     }
                 }
@@ -1548,10 +1547,9 @@ fn cigar_prefix_walk(
                     *rem -= dropped;
                     *apos += -*bpos; // apos -= bpos
                     *bpos = 0;
-                    if *apos >= 0 {
-                        if *rem == 0 {
-                            *rem = 1;
-                        }
+                    if *apos >= 0 && *rem > 0 {
+                        // rem==0: op fully in the gap; skip it (advance cursor) instead of
+                        // parking on a 0-length op. Mirrors PAFtoALN.c cigarPrefix `&& len > 0` fix.
                         return;
                     }
                 }
@@ -2181,15 +2179,23 @@ pub fn tracepoints_to_cigar_fastga_with_aligner(
                 push_op(&mut cigar_ops, a_end - current_a, '=');
             } else {
                 // Mixed segment - realign with WFA
-                if heuristic && num_diff > 0 {
-                    let strategy = compute_banded_static_strategy(
-                        a_end - current_a,
-                        b_end - current_b,
-                        ComplexityMetric::EditDistance,
-                        num_diff as u32,
-                        &aligner.get_distance(),
-                    );
-                    aligner.set_heuristic(Some(&strategy));
+                if heuristic {
+                    if num_diff > 0 {
+                        let strategy = compute_banded_static_strategy(
+                            a_end - current_a,
+                            b_end - current_b,
+                            ComplexityMetric::EditDistance,
+                            num_diff as u32,
+                            &aligner.get_distance(),
+                        );
+                        aligner.set_heuristic(Some(&strategy));
+                    } else {
+                        // Contig/overflow boundary-crossing pieces can carry diff==0 while not being a
+                        // pure match (FASTGA normalizes the indel to the piece boundary). Reusing the
+                        // previous segment's band here sends WFA into unbounded recursion (stack overflow
+                        // under edit, Partial under gap-affine2p). Reset to exact (unbanded) for these.
+                        aligner.set_heuristic(None);
+                    }
                 }
                 align_sequences_wfa(
                     &a_seq[current_a..a_end],
