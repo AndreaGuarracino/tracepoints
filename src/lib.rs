@@ -941,6 +941,16 @@ fn process_cigar_diagonal_distance(
     }
 }
 
+// Reused per-thread BiWFA (ultralow) aligner for big segments (> SEG_ULTRALOW_THRESHOLD_BYTES).
+// Needs a clean mm_allocator; the jemalloc-arena patch crashes BiWFA.
+thread_local! {
+    static SEG_ULTRALOW_ALIGNER: std::cell::RefCell<Option<AffineWavefronts>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Segments longer than this are realigned with BiWFA (linear memory)
+const SEG_ULTRALOW_THRESHOLD_BYTES: usize = 400_000;
+
 /// Reconstruct CIGAR from tracepoints with using provided aligner
 fn reconstruct_cigar_from_segments(
     segments: &[(usize, usize)],
@@ -969,17 +979,46 @@ fn reconstruct_cigar_from_segments(
             // Mixed segment - realign with WFA
             let a_end = current_a + a_len;
             let b_end = current_b + b_len;
-            if let Some(mv) = max_value {
-                let strategy =
-                    compute_banded_static_strategy(a_len, b_len, metric, mv, &aligner.get_distance());
-                aligner.set_heuristic(Some(&strategy));
+            if a_len.max(b_len) > SEG_ULTRALOW_THRESHOLD_BYTES {
+                SEG_ULTRALOW_ALIGNER.with(|cell| {
+                    let mut opt = cell.borrow_mut();
+                    if opt.is_none() {
+                        *opt = Some(aligner.get_distance().create_aligner(
+                            None,
+                            Some(&lib_wfa2::affine_wavefront::MemoryMode::Ultralow),
+                        ));
+                    }
+                    let ul = opt.as_mut().unwrap();
+                    if let Some(mv) = max_value {
+                        let strategy =
+                            compute_banded_static_strategy(a_len, b_len, metric, mv, &ul.get_distance());
+                        ul.set_heuristic(Some(&strategy));
+                    }
+                    align_sequences_wfa(
+                        &a_seq[current_a..a_end],
+                        &b_seq[current_b..b_end],
+                        &*ul,
+                        &mut cigar_ops,
+                    );
+                });
+            } else {
+                if let Some(mv) = max_value {
+                    let strategy = compute_banded_static_strategy(
+                        a_len,
+                        b_len,
+                        metric,
+                        mv,
+                        &aligner.get_distance(),
+                    );
+                    aligner.set_heuristic(Some(&strategy));
+                }
+                align_sequences_wfa(
+                    &a_seq[current_a..a_end],
+                    &b_seq[current_b..b_end],
+                    &*aligner,
+                    &mut cigar_ops,
+                );
             }
-            align_sequences_wfa(
-                &a_seq[current_a..a_end],
-                &b_seq[current_b..b_end],
-                &*aligner,
-                &mut cigar_ops,
-            );
             current_a = a_end;
             current_b = b_end;
         }
