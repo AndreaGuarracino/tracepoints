@@ -1267,8 +1267,8 @@ fn compute_banded_static_strategy(
         }
     };
     HeuristicStrategy::BandedStatic {
-        band_min_k,
-        band_max_k,
+        band_min_k: band_min_k - 1,
+        band_max_k: band_max_k + 1,
     }
 }
 
