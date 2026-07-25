@@ -11,4 +11,4 @@ keywords = ["bioinformatics", "alignment", "compression"]
 
 [dependencies]
 #lib_wfa2 = { path = "/home/guarracino/Dropbox/git/lib_wfa2"}
-lib_wfa2 = { git = "https://github.com/AndreaGuarracino/lib_wfa2", rev = "8859b6a214141968f37d9bcb22552408318adda0"}
+lib_wfa2 = { git = "https://github.com/AndreaGuarracino/lib_wfa2", rev = "fe882ce5f6d4aafc8078a3cdf4b7e69f050b5ef2" }
