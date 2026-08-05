@@ -29,7 +29,8 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use tracepoints::{
     cigar_to_edit_script, cigar_to_tracepoints, edit_script_to_cigar,
-    tracepoints_to_cigar, tracepoints_to_cigar_fastga, ComplexityMetric, Distance,
+    tracepoints_to_cigar, tracepoints_to_cigar_fastga, tracepoints_to_cigar_fastga_nodiff,
+    ComplexityMetric, Distance,
 };
 
 const FLTP_SPACING: u32 = 100;
@@ -39,10 +40,11 @@ const DBTP_BAND: u32 = 32;
 const CIGAR: usize = 0;
 const ES2BIT: usize = 1;
 const FLTP: usize = 2;
-const EBTP: usize = 3;
-const DBTP: usize = 4;
-const N_METHODS: usize = 5;
-const METHOD_NAMES: [&str; N_METHODS] = ["cigar", "es2bit", "fltp", "ebtp", "dbtp"];
+const FLTP_ND: usize = 3;
+const EBTP: usize = 4;
+const DBTP: usize = 5;
+const N_METHODS: usize = 6;
+const METHOD_NAMES: [&str; N_METHODS] = ["cigar", "es2bit", "fltp", "fltp_nd", "ebtp", "dbtp"];
 
 // =============================================================================
 // FASTA / PAF helpers
@@ -115,6 +117,14 @@ fn encode_tp_record(out: &mut Vec<u8>, tps: &[(usize, usize)]) -> usize {
     let start = out.len();
     write_leb128(out, tps.len() as u64);
     for &(a, b) in tps { write_leb128(out, a as u64); write_leb128(out, b as u64); }
+    out.len() - start
+}
+
+// FL-TP no-diff: store only the target advance per tracepoint (drop the per-segment edit count).
+fn encode_tp_record_nodiff(out: &mut Vec<u8>, segs: &[usize]) -> usize {
+    let start = out.len();
+    write_leb128(out, segs.len() as u64);
+    for &b in segs { write_leb128(out, b as u64); }
     out.len() - start
 }
 
@@ -242,6 +252,9 @@ fn main() {
     let mut cigar_identical = [0u64; N_METHODS]; // decoded CIGAR == input CIGAR
     let mut gz_buf: [Vec<u8>; N_METHODS] = Default::default();
 
+    let mut tpa_first: [Vec<u64>; N_METHODS] = Default::default();
+    let mut tpa_second: [Vec<u64>; N_METHODS] = Default::default();
+
     let mut line_no = 0usize;
     let mut skipped = 0usize;
 
@@ -318,17 +331,31 @@ fn main() {
         let tps = cigar_to_fltp_simple(rec.cigar, FLTP_SPACING as usize);
         let enc_ns = t0.elapsed().as_nanos() as u64;
         let disk = encode_tp_record(&mut gz_buf[FLTP], &tps) as u64;
+        for &(a, b) in &tps { tpa_first[FLTP].push(a as u64); tpa_second[FLTP].push(b as u64); }
         let theo = (tps.len() as u64) * ceil_log2(FLTP_SPACING as usize + e) as u64;
         let t0 = Instant::now();
         let dec = tracepoints_to_cigar_fastga(&tps, FLTP_SPACING, a_seq, b_seq, 0, 0, false, false);
         let dec_ns = t0.elapsed().as_nanos() as u64;
         check(FLTP, &dec, enc_ns, dec_ns, theo, disk, tps.len());
 
+        // --- FL-TP no-diff (store only the target advance; drop the per-segment edit count) ---
+        let t0 = Instant::now();
+        let seg_nd: Vec<usize> = tps.iter().map(|&(_, b)| b).collect();
+        let enc_ns = t0.elapsed().as_nanos() as u64;
+        let disk = encode_tp_record_nodiff(&mut gz_buf[FLTP_ND], &seg_nd) as u64;
+        for &b in &seg_nd { tpa_first[FLTP_ND].push(b as u64); }
+        let theo = (seg_nd.len() as u64) * ceil_log2(FLTP_SPACING as usize + e) as u64;
+        let t0 = Instant::now();
+        let dec = tracepoints_to_cigar_fastga_nodiff(&seg_nd, FLTP_SPACING, a_seq, b_seq, 0, false);
+        let dec_ns = t0.elapsed().as_nanos() as u64;
+        check(FLTP_ND, &dec, enc_ns, dec_ns, theo, disk, seg_nd.len());
+
         // --- EB-TP ---
         let t0 = Instant::now();
         let tps = cigar_to_tracepoints(rec.cigar, EBTP_DELTA, ComplexityMetric::EditDistance);
         let enc_ns = t0.elapsed().as_nanos() as u64;
         let disk = encode_tp_record(&mut gz_buf[EBTP], &tps) as u64;
+        for &(a, b) in &tps { tpa_first[EBTP].push(a as u64); tpa_second[EBTP].push(b as u64); }
         let theo = (tps.len() as u64) * ceil_log2(n.max(1) * e.max(1)) as u64;
         let t0 = Instant::now();
         let dec = tracepoints_to_cigar(&tps, a_seq, b_seq, 0, 0, ComplexityMetric::EditDistance, &Distance::Edit);
@@ -340,6 +367,7 @@ fn main() {
         let tps = cigar_to_tracepoints(rec.cigar, DBTP_BAND, ComplexityMetric::DiagonalDistance);
         let enc_ns = t0.elapsed().as_nanos() as u64;
         let disk = encode_tp_record(&mut gz_buf[DBTP], &tps) as u64;
+        for &(a, b) in &tps { tpa_first[DBTP].push(a as u64); tpa_second[DBTP].push(b as u64); }
         let theo = (tps.len() as u64) * ceil_log2(n.max(1) * DBTP_BAND as usize) as u64;
         let t0 = Instant::now();
         let dec = tracepoints_to_cigar(&tps, a_seq, b_seq, 0, 0, ComplexityMetric::DiagonalDistance, &Distance::Edit);
@@ -351,6 +379,39 @@ fn main() {
     if records == 0 { eprintln!("[es2bit_bench] no records"); process::exit(1); }
     if skipped > 0 { eprintln!("[es2bit_bench] skipped {} malformed lines", skipped); }
 
+    // --- TPA payload sizes ---
+    let mut tpa_buf: [Vec<u8>; N_METHODS] = Default::default();
+    let tpa_total: [u64; N_METHODS] = std::array::from_fn(|i| {
+        // CIGAR and ES-2bit have no tracepoint streams; they keep their own encoding, so the
+        // column can be read as "stored bits per edit" for every method.
+        if tpa_first[i].is_empty() { tpa_buf[i] = gz_buf[i].clone(); return total_disk[i]; }
+        let first = tpa::HuffmanStreamCodec::build(&tpa_first[i]).expect("huffman first stream");
+        let mut buf = Vec::new();
+        let mut table = Vec::new();
+        first.table_bytes().expect("huffman table size");
+        table.resize(first.table_bytes().expect("huffman table size"), 0);
+        buf.extend_from_slice(&table);
+        buf.extend_from_slice(&first.encode(&tpa_first[i]).expect("huffman encode"));
+        if !tpa_second[i].is_empty() {
+            if i == FLTP {
+                let second = tpa::HuffmanStreamCodec::build(&tpa_second[i]).expect("huffman second stream");
+                let mut t2 = Vec::new();
+                t2.resize(second.table_bytes().expect("huffman table size"), 0);
+                buf.extend_from_slice(&t2);
+                buf.extend_from_slice(&second.encode(&tpa_second[i]).expect("huffman encode"));
+            } else {
+                buf.extend_from_slice(&tpa::encode_two_dim_delta(&tpa_first[i], &tpa_second[i])
+                    .expect("2d-delta encode"));
+            }
+        }
+        let n = buf.len() as u64;
+        tpa_buf[i] = buf;
+        n
+    });
+    // gzip the TPA payload, so the faded bars are gzip of the solid bars rather than gzip of a
+    // different, unencoded serialization.
+    let tpa_gz: [u64; N_METHODS] = std::array::from_fn(|i| gzip_len(&tpa_buf[i]) as u64);
+
     // --- Summary ---
     let gz: [u64; N_METHODS] = std::array::from_fn(|i| gzip_len(&gz_buf[i]) as u64);
     let se = sum_edits as f64;
@@ -360,6 +421,8 @@ fn main() {
     print!("file\trecords\tmean_n\tmean_e");
     for m in METHOD_NAMES { print!("\t{m}_theo_bits_per_e"); }
     for m in METHOD_NAMES { print!("\t{m}_disk_bits_per_e"); }
+    for m in METHOD_NAMES { print!("\t{m}_tpa_bits_per_e"); }
+    for m in METHOD_NAMES { print!("\t{m}_tpa_gz_bits_per_e"); }
     for m in METHOD_NAMES { print!("\t{m}_disk_B_per_e"); }
     for m in METHOD_NAMES { print!("\t{m}_gz_B_per_e"); }
     for m in METHOD_NAMES { print!("\t{m}_enc_ns_per_e"); }
@@ -376,6 +439,8 @@ fn main() {
         sum_n as f64 / records as f64, se / records as f64);
     for i in 0..N_METHODS { print!("\t{:.3}", pe(total_theo_bits[i])); }
     for i in 0..N_METHODS { print!("\t{:.3}", pe(total_disk[i] * 8)); }
+    for i in 0..N_METHODS { print!("\t{:.3}", pe(tpa_total[i] * 8)); }
+    for i in 0..N_METHODS { print!("\t{:.3}", pe(tpa_gz[i] * 8)); }
     for i in 0..N_METHODS { print!("\t{:.4}", pe(total_disk[i])); }
     for i in 0..N_METHODS { print!("\t{:.4}", pe(gz[i])); }
     for i in 0..N_METHODS { print!("\t{:.1}", pe(total_enc_ns[i])); }
