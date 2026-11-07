@@ -393,16 +393,24 @@ fn main() {
         buf.extend_from_slice(&table);
         buf.extend_from_slice(&first.encode(&tpa_first[i]).expect("huffman encode"));
         if !tpa_second[i].is_empty() {
-            if i == FLTP {
-                let second = tpa::HuffmanStreamCodec::build(&tpa_second[i]).expect("huffman second stream");
-                let mut t2 = Vec::new();
-                t2.resize(second.table_bytes().expect("huffman table size"), 0);
-                buf.extend_from_slice(&t2);
-                buf.extend_from_slice(&second.encode(&tpa_second[i]).expect("huffman encode"));
+            // EB-TP/DB-TP: TPA 2d-delta-huffman, zigzag(target - query) with a file-level Huffman table
+            let vals: Vec<u64> = if i == FLTP {
+                tpa_second[i].clone()
             } else {
-                buf.extend_from_slice(&tpa::encode_two_dim_delta(&tpa_first[i], &tpa_second[i])
-                    .expect("2d-delta encode"));
-            }
+                tpa_first[i]
+                    .iter()
+                    .zip(&tpa_second[i])
+                    .map(|(&a, &b)| {
+                        let d = b as i64 - a as i64;
+                        ((d << 1) ^ (d >> 63)) as u64
+                    })
+                    .collect()
+            };
+            let second = tpa::HuffmanStreamCodec::build(&vals).expect("huffman second stream");
+            let mut t2 = Vec::new();
+            t2.resize(second.table_bytes().expect("huffman table size"), 0);
+            buf.extend_from_slice(&t2);
+            buf.extend_from_slice(&second.encode(&vals).expect("huffman encode"));
         }
         let n = buf.len() as u64;
         tpa_buf[i] = buf;
