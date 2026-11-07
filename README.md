@@ -18,7 +18,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tracepoints = { git = "https://github.com/AndreaGuarracino/tracepoints" }
+tracepoints = { git = "https://github.com/GuarracinoLab/tracepoints" }
 ```
 
 Then simply build your project:

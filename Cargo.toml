@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["Andrea Guarracino <aguarracino@tgen.org>"]
 license = "MIT"
 description = "Compressed alignment representation"
-repository = "https://github.com/AndreaGuarracino/tracepoints"
+repository = "https://github.com/GuarracinoLab/tracepoints"
 readme = "README.md"
 keywords = ["bioinformatics", "alignment", "compression"]
 
